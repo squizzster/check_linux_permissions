@@ -1,102 +1,153 @@
 # check_linux_permissions
 
-`check_permissions.py` is a best-effort Linux auditing tool for recursively estimating whether paths are:
+`check_permissions.py` answers a deceptively powerful question:
 
-- deletable
-- writable
-- writable or deletable
+> **What could this account actually change or remove on this Linux system right now — without me poking files, writing test data, or deleting anything?**
 
-It does this **without deleting anything** and **without opening regular files for writing**.
+That is what makes it useful.
 
-For regular files, the implementation is designed not to change:
+Most permission checks are either too shallow to be trusted or too invasive to feel safe on a real machine. This tool sits in the sweet spot:
 
-- contents
-- size
-- atime
-- mtime
-- ctime
+- it **walks the real filesystem**
+- it **models Linux deletion and writability rules**
+- it **does not delete anything**
+- it **does not open regular files for writing**
+- for regular files, it is designed not to change **contents, size, atime, mtime, or ctime**
 
-The default command is:
+So instead of asking Linux “please let me try something dangerous,” it asks a better question:
+
+> **If I tried right now, what would probably work?**
+
+That makes it great for:
+
+- permission reviews
+- security hardening
+- checking what a service account can really do
+- spotting unexpectedly broad access
+- sanity-checking a host before you trust it
+
+---
+
+## Why this is special
+
+This is not just a “find writable files” script.
+
+For deletion, Linux usually cares more about the **parent directory** than the file itself. That trips people up all the time. A file can be non-writable and still removable. A file can be writable and still not removable. A directory can look fine until the sticky bit, mount flags, or immutable flags change the answer.
+
+This tool handles that kind of logic for you.
+
+It does a best-effort simulation of what Linux would likely allow for:
+
+- **delete**
+- **write**
+- **write or delete**
+
+And it does it while staying deliberately low-impact.
+
+---
+
+## The default behavior is intentionally useful
+
+Run this:
 
 ```bash
 python check_permissions.py
 ```
 
-That performs a recursive scan starting at `/` and prints only paths that the current process would likely be able to remove, while suppressing paths under the current user's home directory.
-
-## What it is for
-
-This tool is useful for:
-
-- permission-boundary audits
-- host hardening reviews
-- finding unexpectedly removable paths
-- finding unexpectedly writable paths
-- low-impact triage on production or sensitive systems
-
-It is a simulator, not an enforcement tool.
-
-## Default behavior
-
-With no arguments, the script:
+By default it:
 
 - scans from `/`
-- uses **delete-only** mode (`--can-delete-only`)
-- prints only passing results
-- suppresses output under the invoking user's home directory unless `--include-home` is given
-- emits output as it walks
-- exits cleanly on broken pipes such as `head`
-- exits with code `130` on `Ctrl-C`
+- behaves like a best-effort `rm -rf` simulator
+- prints only paths that look **deletable**
+- hides paths under the current user's home directory
+- streams results as it walks
+- exits cleanly if you pipe into `head` or stop with `Ctrl-C`
 
-So this:
+In plain English, the default scan asks:
+
+> **Outside normal user-owned space, what could this account probably remove right now?**
+
+That is an excellent first-pass hardening check.
+
+If it prints **nothing**, that is often a very reassuring result.
+
+If it prints **something**, that does **not** automatically mean the system is bad — but it does mean you have found something worth understanding.
+
+---
+
+## Quick start
+
+### See what this account could probably delete
 
 ```bash
 python check_permissions.py
 ```
 
-roughly answers:
+### See what it could probably write
 
-> Outside normal home-directory space, what paths could this account probably remove right now?
+```bash
+python check_permissions.py --can-write-only
+```
 
-## Important limitations
+### See what it could probably write **or** delete
 
-This is a **best-effort estimate**, not a formal guarantee.
+```bash
+python check_permissions.py --can-write-or-delete
+```
 
-Reality can differ because of:
+### Include your home directory too
 
-- SELinux, AppArmor, Landlock, and other MAC policies
-- races while the filesystem is changing
-- FUSE, NFS, and other unusual filesystem behavior
-- namespace differences
-- kernel- or filesystem-specific corner cases
+```bash
+python check_permissions.py --include-home
+```
 
-A printed path is a signal to review. It is not proof that the system is misconfigured.
+### Show labels in path output
 
-## What the script checks
+```bash
+python check_permissions.py --label --can-write-or-delete
+```
 
-### Delete simulation
+### Show failures, unknowns, and reasons
 
-Delete checks are modeled around Linux directory-entry removal rules, not file content modification. In practice the script looks at things such as:
+```bash
+python check_permissions.py --all-results --format tsv
+```
 
-- parent directory write + search permission
+### Limit the scan to a few roots
+
+```bash
+python check_permissions.py /etc /var /srv
+```
+
+---
+
+## What it really checks
+
+### Delete checks
+
+Deletion on Linux is mostly about whether you can remove a **directory entry**, not whether you can modify file contents.
+
+So for delete simulation, the script checks things like:
+
+- whether the **parent directory** is writable and searchable
 - sticky-bit restrictions
-- `CAP_FOWNER` when effective-ID mode is used
+- `CAP_FOWNER` when effective-ID mode is in use
 - read-only mounts
+- mountpoint handling
 - immutable and append-only inode flags when available
-- mountpoint detection
-- child failures when deciding whether a directory would become removable
+- whether child entries would stop a directory from becoming removable
 
-### Write simulation
+### Write checks
 
-Write checks are path-type aware:
+Write simulation is path-type aware:
 
 - regular files and other non-directories are checked for writability
-- directories are treated as writable only when they are both writable **and** searchable (`x`)
-- symlink writability is reported as `UNKNOWN`
+- directories count as writable only when they are both **writable and searchable**
+- symlink writability is reported as **UNKNOWN** rather than pretending the mode bits mean something useful
 
-### Filesystem confidence downgrades
+### Confidence downgrades on special filesystems
 
-By default, several kernel pseudo-filesystems are treated conservatively and may be downgraded to `UNKNOWN`, including:
+By default, some special kernel pseudo-filesystems are treated conservatively and can be downgraded to `UNKNOWN`, including:
 
 - `proc`
 - `sysfs`
@@ -110,15 +161,47 @@ By default, several kernel pseudo-filesystems are treated conservatively and may
 - `fusectl`
 - `autofs`
 
-Use `--no-special-fs-unknown` to disable that downgrade.
+You can disable that behavior with:
+
+```bash
+python check_permissions.py --no-special-fs-unknown
+```
+
+---
+
+## What it does **not** promise
+
+This tool is careful. It is not magical.
+
+It is a **best-effort simulator**, not a formal proof.
+
+Real-world results can still differ because of:
+
+- SELinux, AppArmor, Landlock, or other MAC systems
+- races while the filesystem is changing
+- FUSE, NFS, and other odd filesystems
+- namespace differences
+- kernel- or filesystem-specific corner cases
+
+So the right mental model is:
+
+> **This is an extremely useful signal, not a legal guarantee.**
+
+---
 
 ## Root behavior
 
-The script is primarily intended for **non-root perspective** auditing.
+This tool is mainly meant to answer:
 
-If it is started with effective UID 0 and `--run-as-root` is **not** supplied, it does not scan. Instead it prints a warning and exits with status `2`.
+> **What can a non-root account get away with?**
 
-If you really want root-context results, run something like:
+So if you run it as root **without** `--run-as-root`, it refuses to do the scan and exits with status `2`.
+
+That is deliberate.
+
+Root can often write or delete things that an ordinary user never could, so defaulting to root-mode results would make the tool much less useful for normal auditing.
+
+If you really do want a root-context scan, opt in explicitly:
 
 ```bash
 python check_permissions.py --run-as-root --exclude /proc /
@@ -126,83 +209,7 @@ python check_permissions.py --run-as-root --exclude /proc /
 
 Excluding `/proc` is strongly recommended for root scans because it can be noisy and misleading.
 
-## Usage
-
-### Default scan
-
-```bash
-python check_permissions.py
-```
-
-### Scan specific roots
-
-```bash
-python check_permissions.py /etc /var /srv
-```
-
-### Show writable paths only
-
-```bash
-python check_permissions.py --can-write-only
-```
-
-### Show paths that are writable or deletable
-
-```bash
-python check_permissions.py --can-write-or-delete
-```
-
-### Include home-directory results
-
-```bash
-python check_permissions.py --include-home
-```
-
-### Show all results, including failures, unknowns, and skips
-
-```bash
-python check_permissions.py --all-results --format tsv
-```
-
-### Restrict printed output to directories
-
-```bash
-python check_permissions.py --directories-only
-```
-
-### Exclude specific paths or subtrees
-
-```bash
-python check_permissions.py / --exclude /var/cache /tmp/scratch
-```
-
-`--exclude` may be repeated. Directories are excluded recursively.
-
-### Stay on the same filesystem
-
-```bash
-python check_permissions.py --one-file-system /
-```
-
-### Skip `/` itself
-
-```bash
-python check_permissions.py --preserve-root /
-```
-
-### Use real IDs instead of effective IDs
-
-```bash
-python check_permissions.py --real-ids /some/path
-```
-
-By default the script uses effective-ID semantics where supported. `--real-ids` switches `os.access` and sticky-bit ownership tests to real-ID behavior and ignores effective capabilities.
-
-### Write results to a file
-
-```bash
-python check_permissions.py --format jsonl --output results.jsonl /etc /var
-```
+---
 
 ## Output formats
 
@@ -217,7 +224,9 @@ Notes:
 
 ### `jsonl`
 
-Prints one JSON object per line with this schema:
+Prints one JSON object per line.
+
+Example:
 
 ```json
 {"status":"WOULD_REMOVE","kind":"file","path":"/tmp/example","reasons":[],"mode":"can_delete_only"}
@@ -225,17 +234,19 @@ Prints one JSON object per line with this schema:
 
 ### `tsv`
 
-Prints tab-separated rows with this header:
+Prints tab-separated output with this header:
 
 ```text
 status    kind    mode    path    reasons
 ```
 
-`reasons` is a JSON array serialized into one TSV field.
+The `reasons` field is a JSON array stored inside one TSV column.
+
+---
 
 ## Status values
 
-Depending on mode, a record can have one of these statuses:
+Depending on mode, records can have these statuses:
 
 - `WOULD_REMOVE`
 - `WOULD_WRITE`
@@ -244,29 +255,20 @@ Depending on mode, a record can have one of these statuses:
 - `UNKNOWN`
 - `SKIP`
 
-By default, only the passing status for the selected mode is printed. Use `--all-results` to include failures, unknowns, and skips.
+By default, only the passing status for the selected mode is printed.
 
-## Kind values
+Use `--all-results` if you want the whole picture.
 
-The script classifies paths as:
-
-- `file`
-- `dir`
-- `symlink`
-- `fifo`
-- `socket`
-- `char`
-- `block`
-- `other`
+---
 
 ## Labels
 
-`--label`, `--add-label`, and `--add-labels` are the same feature.
+`--label`, `--add-label`, and `--add-labels` all do the same thing.
 
 When used with `--format paths`, passing entries are prefixed with:
 
-- `[d]` for deletable entries
-- `[w]` for writable-only entries
+- `[d]` = deletable
+- `[w]` = writable but not deletable
 
 In `--can-write-or-delete` mode, `[d]` wins if both checks would pass.
 
@@ -277,44 +279,98 @@ python check_permissions.py --label /tmp
 python check_permissions.py --add-labels --can-write-or-delete /dev
 ```
 
-Structured formats (`jsonl`, `tsv`) are unchanged by labels.
+Structured formats (`jsonl` and `tsv`) do not change.
 
-## Home-directory suppression
+---
 
-By default, output under the current user's home directory is suppressed.
+## Useful options
 
-This suppression is more robust than simply checking `$HOME`: the script also considers the real and effective users and `SUDO_USER` when discovering likely home directories, and it also checks resolved realpaths so symlinked-home paths are usually suppressed too.
+### Exclude paths or whole subtrees
 
-This affects **printing only**. It does **not** prevent scanning those paths.
+```bash
+python check_permissions.py / --exclude /var/cache /tmp/scratch
+```
 
-## Exclusions
+You can repeat `--exclude`.
 
-Excluded paths are skipped **before scanning** and **before output filtering**.
+Directories are excluded recursively.
 
-Behavior:
+### Stay on one filesystem
 
-- excluding a directory excludes the whole subtree
-- excluding a non-directory excludes that exact path
-- realpath fallbacks are also considered, so symlink-resolved paths can be excluded too
+```bash
+python check_permissions.py --one-file-system /
+```
 
-## Interpretation guidance
+### Skip `/` itself
 
-Some findings are normal. Examples include:
+```bash
+python check_permissions.py --preserve-root /
+```
 
-- temp directories
-- service-owned writable working trees
-- intentionally shared directories
-- writable content inside containers or chroots
+### Only print directories
 
-A useful workflow is:
+```bash
+python check_permissions.py --directories-only
+```
 
-1. run the default scan
-2. inspect anything surprising
-3. rerun with `--all-results --format tsv` to see reasons
-4. rerun with `--can-write-only` or `--can-write-or-delete` for broader coverage
-5. add `--exclude` or `--one-file-system` when you want a tighter review scope
+### Use real IDs instead of effective IDs
 
-## Examples
+```bash
+python check_permissions.py --real-ids /some/path
+```
+
+By default, the script prefers effective-ID semantics where supported.
+`--real-ids` switches access and sticky-bit ownership tests to real-ID behavior and ignores effective capabilities.
+
+### Write output to a file
+
+```bash
+python check_permissions.py --format jsonl --output results.jsonl /etc /var
+```
+
+---
+
+## Why home-directory paths are hidden by default
+
+Because they are usually boring.
+
+Your own home directory is often expected to be writable or deletable by you. The default output is trying to show you the **interesting** stuff outside that normal zone.
+
+The script still scans those paths. It just suppresses them from output unless you ask for them with `--include-home`.
+
+It also tries to detect home directories robustly by considering:
+
+- `$HOME`
+- the real user
+- the effective user
+- `SUDO_USER`
+- resolved realpaths
+
+So symlinked-home paths are usually hidden too.
+
+---
+
+## A good way to use it
+
+Start simple:
+
+```bash
+python check_permissions.py
+```
+
+Then, if needed:
+
+1. inspect anything surprising
+2. rerun with `--all-results --format tsv` to see why something passed, failed, or is unknown
+3. rerun with `--can-write-only` if you care about write exposure
+4. rerun with `--can-write-or-delete` for a broader capability view
+5. add `--exclude` or `--one-file-system` to focus the scan
+
+This workflow is fast, safe, and genuinely useful on real systems.
+
+---
+
+## Example commands
 
 Default non-root audit:
 
@@ -322,32 +378,30 @@ Default non-root audit:
 python check_permissions.py
 ```
 
-Broader capability sweep with labels:
+Broader capability scan with labels:
 
 ```bash
 python check_permissions.py --can-write-or-delete --label /tmp /var
 ```
 
-TSV output including failures and unknowns:
+Show everything with reasons in TSV:
 
 ```bash
 python check_permissions.py --all-results --format tsv /etc /var
 ```
 
-Root-context scan with an explicit opt-in:
+Root-context scan with explicit opt-in:
 
 ```bash
 python check_permissions.py --run-as-root --exclude /proc --one-file-system /
 ```
 
-## Summary
+---
 
-`check_permissions.py` is a low-impact Linux auditing tool for answering questions like:
+## In one sentence
 
-> What could this account probably delete?
->
-> What could it probably write?
->
-> What looks unexpectedly broad outside normal user-owned space?
+`check_permissions.py` is a low-impact Linux permissions reality-check:
 
-It is most useful as a fast review tool for hardening and permission-boundary checks, not as a substitute for actually enforcing policy.
+> **It shows what an account could probably delete or write without actually touching regular file contents or deleting anything.**
+
+That is why it is useful, and that is why it is a bit special.
