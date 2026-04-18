@@ -49,7 +49,7 @@ import stat
 import sys
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar
 
 STATUS_WOULD_REMOVE = "WOULD_REMOVE"
 STATUS_WOULD_WRITE = "WOULD_WRITE"
@@ -85,6 +85,8 @@ LABEL_DELETE = "d"
 LABEL_WRITE = "w"
 
 CAP_FOWNER = 3
+
+T = TypeVar("T")
 
 AT_FDCWD = -100
 AT_SYMLINK_NOFOLLOW = 0x100
@@ -157,6 +159,12 @@ class FlagCheck:
     @property
     def uncertain(self) -> bool:
         return self.error_reason is not None
+
+
+@dataclass(frozen=True)
+class ExcludedPath:
+    path: str
+    recursive: bool
 
 
 def statx_flags(path: str) -> FlagCheck:
@@ -421,6 +429,33 @@ def discover_home_dirs_with_realpaths() -> List[str]:
     return [h for h in dedupe_keep_order(expanded) if h and h != "/"]
 
 
+def _path_matches_with_realpath_fallback(
+    path: str,
+    candidates: Sequence[T],
+    matches_candidate: Callable[[T, str], bool],
+) -> bool:
+    """
+    Check a normalized lexical path first, then fall back to a cached realpath.
+
+    This keeps the common case fast while still handling symlink-resolved paths
+    consistently for callers that want lexical-first semantics.
+    """
+    normalized = normalize(path)
+
+    for candidate in candidates:
+        if matches_candidate(candidate, normalized):
+            return True
+
+    real = real_normalize(normalized)
+    if real == normalized:
+        return False
+
+    for candidate in candidates:
+        if matches_candidate(candidate, real):
+            return True
+    return False
+
+
 def path_is_within_any_home(path: str, home_dirs: Sequence[str]) -> bool:
     """
     Check lexical absolute paths first, then fall back to a cached realpath.
@@ -428,21 +463,65 @@ def path_is_within_any_home(path: str, home_dirs: Sequence[str]) -> bool:
     This keeps the common case fast while still suppressing symlinked-home paths
     by default.
     """
-    normalized = normalize(path)
 
-    for home_dir in home_dirs:
-        if is_path_prefix(home_dir, normalized):
-            return True
+    def matches_home(home_dir: str, candidate_path: str) -> bool:
+        return is_path_prefix(home_dir, candidate_path)
 
-    real = real_normalize(normalized)
-    if real == normalized:
-        return False
+    return _path_matches_with_realpath_fallback(path, home_dirs, matches_home)
 
-    for home_dir in home_dirs:
-        if is_path_prefix(home_dir, real):
-            return True
-    return False
 
+def path_is_within_any_excluded(path: str, excluded_paths: Sequence[ExcludedPath]) -> bool:
+    """
+    Check lexical absolute paths first, then fall back to a cached realpath.
+
+    Excluding a directory excludes its whole subtree. Excluding a non-directory
+    path excludes just that exact path unless the realpath resolves underneath an
+    excluded directory.
+    """
+
+    def matches_excluded(excluded_path: ExcludedPath, candidate_path: str) -> bool:
+        if excluded_path.recursive:
+            return is_path_prefix(excluded_path.path, candidate_path)
+        return candidate_path == excluded_path.path
+
+    return _path_matches_with_realpath_fallback(path, excluded_paths, matches_excluded)
+
+
+
+def _dedupe_excluded_paths(items: Iterable[ExcludedPath]) -> List[ExcludedPath]:
+    seen: Set[Tuple[str, bool]] = set()
+    out: List[ExcludedPath] = []
+    for item in items:
+        key = (item.path, item.recursive)
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+
+def normalize_excluded_paths(raw_paths: Sequence[str]) -> List[ExcludedPath]:
+    expanded: List[ExcludedPath] = []
+    for raw_path in raw_paths:
+        normalized = normalize(raw_path)
+        recursive = raw_path.endswith(os.sep)
+        try:
+            recursive = recursive or stat.S_ISDIR(os.lstat(normalized).st_mode)
+        except OSError:
+            pass
+
+        expanded.append(ExcludedPath(normalized, recursive))
+        try:
+            real = normalize(os.path.realpath(normalized))
+            real_recursive = recursive
+            try:
+                real_recursive = real_recursive or stat.S_ISDIR(os.lstat(real).st_mode)
+            except OSError:
+                pass
+            expanded.append(ExcludedPath(real, real_recursive))
+        except OSError:
+            pass
+    return [p for p in _dedupe_excluded_paths(expanded) if p.path]
 
 
 class MountTable:
@@ -697,6 +776,14 @@ def classify_kind(st: os.stat_result) -> str:
 
 
 
+def mode_needs_delete(mode: str) -> bool:
+    return mode in {MODE_CAN_DELETE_ONLY, MODE_CAN_WRITE_OR_DELETE}
+
+
+def mode_needs_write(mode: str) -> bool:
+    return mode in {MODE_CAN_WRITE_ONLY, MODE_CAN_WRITE_OR_DELETE}
+
+
 class Simulator:
     def __init__(
         self,
@@ -705,12 +792,14 @@ class Simulator:
         one_file_system: bool,
         unknown_fstypes: Optional[set[str]],
         effective_access: bool,
+        excluded_paths: Optional[Sequence[str]] = None,
     ):
         self.mounts = mounts
         self.preserve_root = preserve_root
         self.one_file_system = one_file_system
         self.unknown_fstypes = unknown_fstypes
         self.effective_access = effective_access
+        self.excluded_paths = tuple(normalize_excluded_paths(excluded_paths or ()))
         self.uid = os.geteuid() if effective_access else os.getuid()
         self.caps = parse_caps() if effective_access else 0
         self.seen_dirs: Set[Tuple[int, int]] = set()
@@ -815,17 +904,14 @@ class Simulator:
             for entry in it:
                 yield entry
 
-    def scan_dir(self, path: str) -> Tuple[Optional[List[os.DirEntry]], Optional[str]]:
-        try:
-            with os.scandir(path) as it:
-                return list(it), None
-        except PermissionError as e:
-            return None, f"cannot_scan_dir:{e.strerror or 'Permission denied'}"
-        except OSError as e:
-            return None, f"cannot_scan_dir_errno_{e.errno}:{e.strerror}"
-
-    def simulate_path(self, path: str, root_dev: Optional[int] = None) -> Iterator[Assessment]:
-        yield from self._simulate_path(path, root_dev=root_dev)
+    def simulate_path(
+        self,
+        path: str,
+        *,
+        mode: str = MODE_CAN_DELETE_ONLY,
+        root_dev: Optional[int] = None,
+    ) -> Iterator[Assessment]:
+        yield from self._simulate_path(path, mode=mode, root_dev=root_dev)
 
     def _basic_assessment(
         self,
@@ -848,9 +934,26 @@ class Simulator:
     def _prepare_path(
         self,
         path: str,
+        *,
+        mode: str,
         root_dev: Optional[int] = None,
     ) -> Tuple[str, Optional[os.stat_result], Optional[Tuple[int, int]], Optional[List[Assessment]]]:
         path = normalize(path)
+
+        if self.excluded_paths and path_is_within_any_excluded(path, self.excluded_paths):
+            excluded_kind = KIND_OTHER
+            try:
+                excluded_kind = classify_kind(os.lstat(path))
+            except OSError:
+                pass
+            return path, None, None, [
+                self._basic_assessment(
+                    kind=excluded_kind,
+                    path=path,
+                    verdict=VERDICT_SKIP,
+                    reasons=["excluded_path"],
+                )
+            ]
 
         if self.preserve_root and path == "/":
             return path, None, None, [
@@ -908,7 +1011,7 @@ class Simulator:
             ]
 
         if kind != KIND_DIR:
-            return path, None, None, [self.classify_leaf(path, st, kind)]
+            return path, None, None, [self.classify_leaf(path, st, kind, mode=mode)]
 
         dir_key = (st.st_dev, st.st_ino)
         if dir_key in self.seen_dirs:
@@ -925,15 +1028,30 @@ class Simulator:
         self.seen_dirs.add(dir_key)
         return path, st, dir_key, None
 
-    def _directory_scan_failure(self, path: str, st: os.stat_result, reason: str) -> Assessment:
-        write_verdict, write_reasons = self.classify_dir_write_only(path, st)
+    def _directory_scan_failure(
+        self,
+        path: str,
+        st: os.stat_result,
+        reason: str,
+        *,
+        mode: str,
+    ) -> Assessment:
+        delete_verdict = VERDICT_UNKNOWN
+        delete_reasons = [reason]
+        write_verdict = VERDICT_UNKNOWN
+        write_reasons = [reason]
+
+        if mode_needs_write(mode):
+            write_verdict, write_only_reasons = self.classify_dir_write_only(path, st)
+            write_reasons = dedupe_keep_order([reason] + write_only_reasons)
+
         return Assessment(
             kind=KIND_DIR,
             path=path,
-            delete_verdict=VERDICT_UNKNOWN,
-            delete_reasons=[reason],
+            delete_verdict=delete_verdict,
+            delete_reasons=delete_reasons,
             write_verdict=write_verdict,
-            write_reasons=dedupe_keep_order([reason] + write_reasons),
+            write_reasons=write_reasons,
         )
 
     def _final_directory_assessment(
@@ -941,11 +1059,20 @@ class Simulator:
         path: str,
         st: os.stat_result,
         *,
+        mode: str,
         unknown_children: bool,
         failed_children: bool,
     ) -> Assessment:
-        delete_verdict, delete_reasons = self.classify_dir_delete(path, st, unknown_children, failed_children)
-        write_verdict, write_reasons = self.classify_dir_write_only(path, st)
+        delete_verdict = VERDICT_UNKNOWN
+        delete_reasons: List[str] = []
+        write_verdict = VERDICT_UNKNOWN
+        write_reasons: List[str] = []
+
+        if mode_needs_delete(mode):
+            delete_verdict, delete_reasons = self.classify_dir_delete(path, st, unknown_children, failed_children)
+        if mode_needs_write(mode):
+            write_verdict, write_reasons = self.classify_dir_write_only(path, st)
+
         return Assessment(
             kind=KIND_DIR,
             path=path,
@@ -969,8 +1096,14 @@ class Simulator:
                 failed_children = True
         return unknown_children, failed_children
 
-    def _simulate_path(self, path: str, root_dev: Optional[int] = None) -> Iterator[Assessment]:
-        path, st, dir_key, terminal = self._prepare_path(path, root_dev=root_dev)
+    def _simulate_path(
+        self,
+        path: str,
+        *,
+        mode: str,
+        root_dev: Optional[int] = None,
+    ) -> Iterator[Assessment]:
+        path, st, dir_key, terminal = self._prepare_path(path, mode=mode, root_dev=root_dev)
         if terminal is not None:
             yield from terminal
             return
@@ -986,20 +1119,22 @@ class Simulator:
                 for entry in self.iter_dir_entries(path):
                     child_path = os.path.join(path, entry.name)
                     child_direct: Optional[Assessment] = None
-                    for child_assessment in self._simulate_path(child_path, root_dev=root_dev):
+                    for child_assessment in self._simulate_path(child_path, mode=mode, root_dev=root_dev):
                         if child_direct is None and normalize(child_assessment.path) == normalize(child_path):
                             child_direct = child_assessment
                         yield child_assessment
-                    unknown_children, failed_children = self._merge_child_delete_flags(
-                        child_direct,
-                        unknown_children=unknown_children,
-                        failed_children=failed_children,
-                    )
+                    if mode_needs_delete(mode):
+                        unknown_children, failed_children = self._merge_child_delete_flags(
+                            child_direct,
+                            unknown_children=unknown_children,
+                            failed_children=failed_children,
+                        )
             except PermissionError as e:
                 yield self._directory_scan_failure(
                     path,
                     st,
                     f"cannot_scan_dir:{e.strerror or 'Permission denied'}",
+                    mode=mode,
                 )
                 return
             except OSError as e:
@@ -1007,21 +1142,38 @@ class Simulator:
                     path,
                     st,
                     f"cannot_scan_dir_errno_{e.errno}:{e.strerror}",
+                    mode=mode,
                 )
                 return
 
             yield self._final_directory_assessment(
                 path,
                 st,
+                mode=mode,
                 unknown_children=unknown_children,
                 failed_children=failed_children,
             )
         finally:
             self.seen_dirs.discard(dir_key)
 
-    def classify_leaf(self, path: str, st: os.stat_result, kind: str) -> Assessment:
-        delete_verdict, delete_reasons = self.classify_leaf_delete(path, st, kind)
-        write_verdict, write_reasons = self.classify_leaf_write_only(path, st, kind)
+    def classify_leaf(
+        self,
+        path: str,
+        st: os.stat_result,
+        kind: str,
+        *,
+        mode: str,
+    ) -> Assessment:
+        delete_verdict = VERDICT_UNKNOWN
+        delete_reasons: List[str] = []
+        write_verdict = VERDICT_UNKNOWN
+        write_reasons: List[str] = []
+
+        if mode_needs_delete(mode):
+            delete_verdict, delete_reasons = self.classify_leaf_delete(path, st, kind)
+        if mode_needs_write(mode):
+            write_verdict, write_reasons = self.classify_leaf_write_only(path, st, kind)
+
         return Assessment(
             kind=kind,
             path=path,
@@ -1184,7 +1336,7 @@ class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescript
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     home = os.path.expanduser("~")
     example_home = normalize(home) if home else "$HOME"
-    prog = os.path.basename(sys.argv[0]) or "check_permissions_v8.py"
+    prog = os.path.basename(sys.argv[0]) or "check_permissions.py"
 
     p = argparse.ArgumentParser(
         prog=prog,
@@ -1200,11 +1352,17 @@ Examples:
   %(prog)s --all-results --format tsv /etc /var
   %(prog)s --can-write-only --directories-only /srv/data
   %(prog)s --include-home {example_home}
+  %(prog)s /srv --exclude /var/cache /tmp/a_file
+  %(prog)s --run-as-root --one-file-system /
 
 Output filtering:
   By default, paths under your home directory are suppressed from output. This
   only affects what is printed, not what gets scanned. Use --include-home to
   show them.
+
+Exclusions:
+  --exclude skips matching files and whole directory subtrees before scanning
+  and before output.
 
 Path labels:
   --label, --add-label, and --add-labels are the same feature. They affect only
@@ -1239,6 +1397,25 @@ Capability modes:
         choices=("paths", "jsonl", "tsv"),
         default="paths",
         help="Output format. 'paths' prints escaped path strings.",
+    )
+    p.add_argument(
+        "--run-as-root",
+        "--run_as_root",
+        dest="run_as_root",
+        action="store_true",
+        help="Allow execution as root. Use with caution.",
+    )
+    p.add_argument(
+        "--exclude",
+        dest="exclude_paths",
+        nargs="+",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Exclude specific files or directories from scanning. Directories are "
+            "excluded recursively. May be repeated."
+        ),
     )
     p.add_argument(
         "--preserve-root",
@@ -1473,7 +1650,7 @@ def stream_outcomes(ns: argparse.Namespace, sim: Simulator) -> Iterator[Outcome]
             root_dev = os.lstat(path).st_dev
         except OSError:
             root_dev = None
-        for assessment in sim.simulate_path(path, root_dev=root_dev):
+        for assessment in sim.simulate_path(path, mode=ns.mode, root_dev=root_dev):
             outcome = assessment.render(ns.mode)
             if should_keep_for_output(
                 outcome,
@@ -1485,8 +1662,28 @@ def stream_outcomes(ns: argparse.Namespace, sim: Simulator) -> Iterator[Outcome]
                 yield outcome
 
 
+def flatten_exclude_args(groups: Sequence[Sequence[str]]) -> List[str]:
+    return [path for group in groups for path in group]
+
+
 def main(argv: Sequence[str]) -> int:
     ns = parse_args(argv)
+    ns.exclude_paths = flatten_exclude_args(ns.exclude_paths)
+
+    if os.geteuid() == 0 and not ns.run_as_root:
+        sys.stderr.write(
+            "This tool is primarily intended to audit filesystem permissions from a non-root user perspective.\n"
+            "Running it as root is usually not useful, because root can write or delete many paths that would not\n"
+            "be writable or deletable for an ordinary user.\n"
+            "\n"
+            "If you really want root-context results, re-run with:\n"
+            "    --run-as-root --exclude /proc\n"
+            "\n"
+            "At minimum, excluding /proc is strongly recommended. On SELinux-enabled systems and similar\n"
+            "environments, scanning /proc as root can generate extremely noisy access-denied messages.\n"
+        )
+        sys.stderr.flush()
+        return 2
 
     sim = Simulator(
         mounts=MountTable(parse_mountinfo()),
@@ -1494,6 +1691,7 @@ def main(argv: Sequence[str]) -> int:
         one_file_system=ns.one_file_system,
         unknown_fstypes=None if ns.no_special_fs_unknown else set(DEFAULT_UNKNOWN_FSTYPES),
         effective_access=not ns.real_ids,
+        excluded_paths=ns.exclude_paths,
     )
 
     if ns.output == "-":
