@@ -1,120 +1,103 @@
 # check_linux_permissions
 
-`check_permissions.py` audits a UNIX/Linux system from a **real user perspective** and shows you where the filesystem has become more permissive than it should be.
+In one sentence:
 
-That is the whole point.
+**`check_permissions.py` is a safe, non-intrusive UNIX/Linux filesystem audit tool for finding the places where a user account can write or delete outside the tight boundaries it should normally be limited to.**
 
-On a properly controlled system, a user should only be able to write to, modify, or remove a **small, tightly controlled** set of paths.
+That is what it does.
 
-But real systems do not stay clean forever.
+Not in theory.
+Not by trial and error.
+Not by doing anything destructive.
 
-Permissions drift.
+It audits a live UNIX/Linux filesystem from a **real user perspective** and shows you where permissions have drifted.
+
+## What matters
+
+This tool is about three things:
+
+- **does no harm**
+- **changes nothing**
+- **detects drift**
+
+Over time, systems change.
+
 Directories get repurposed.
-Service trees get left writable.
-Ownership changes.
-Mount layouts change.
-Temporary fixes become permanent.
-And over time, the filesystem often ends up allowing things that nobody meant to allow.
+Ownership gets altered.
+Temporary fixes stay in place.
+Service trees are left broader than intended.
+Writable areas spread.
+Old paths are never tightened back down.
 
-That is what this tool is for.
+That is how filesystem weakness appears on otherwise respectable systems: not always through one huge mistake, but through slow permission drift.
 
-It helps you find the places where an ordinary account can do things it should not be able to do — exactly the kind of quiet filesystem weakness that bad actors take advantage of.
+And that is exactly what this tool is meant to find.
 
----
+## Why you would run it
 
-## What makes it special
+A normal user account should usually be able to modify or delete only a **small, tightly controlled** set of paths.
 
-Most filesystem checks are unsatisfying.
+When that stops being true, bad actors gain room to move.
 
-They either:
+This tool helps you spot:
 
-- test the wrong thing
-- make too much noise
-- or do something intrusive you do not want to run on a live machine
+- unexpectedly removable paths
+- unexpectedly writable paths
+- weak privilege boundaries
+- filesystem areas that have become too permissive over time
+- places an attacker could use as a foothold after landing in an account
 
-This tool is different.
+It is useful for:
 
-It audits the real filesystem **without deleting anything** and **without opening regular files for writing**.
+- security reviews
+- host hardening checks
+- privilege boundary auditing
+- finding unexpectedly removable or writable paths
+- quickly spotting filesystem areas that deserve closer investigation
+
+## Why it is safe
+
+This is the point.
+
+The tool does **not** delete anything.
+It does **not** open regular files for writing.
+It does **not** mutate the filesystem while auditing it.
 
 For regular files, it is designed not to change:
 
-- contents
+- file contents
 - size
 - atime
 - mtime
 - ctime
 
-That is why it is so useful.
+So you can inspect a live system from the point of view that matters — the current account — without doing harm in the process.
 
-You get a serious filesystem audit from the point of view that matters — the current account — without poking the machine in a dangerous way.
+## Its default use is simple
 
----
+```bash
+python check_permissions.py
+```
+
+On a well-locked-down production system, that will often print **nothing at all**.
+
+If it does print paths, that means the current user can remove entries **outside the current home directory** under the conditions checked by the tool.
+
+That is often worth reviewing from a security and hardening perspective.
+It does **not** automatically mean the system is broken or insecure, but it **does** mean there are paths with broader permissions than many production environments would normally allow.
 
 ## What the output means
 
-This part should be simple.
+This should be read very plainly.
 
-If the tool prints a path in normal passing output, then the account you ran it as **can** do that thing under the selected mode.
+If the tool prints a path in normal passing output, then the account you ran it as **can** do that thing in the selected mode.
 
 - in default mode, printed paths are paths the account can remove
 - in `--can-write-only`, printed paths are paths the account can write to
 - in `--can-write-or-delete`, printed paths are paths the account can write to or remove
 
 That is why the output matters.
-
-It is not trivia.
-It is not theory.
-It is telling you where the account has filesystem power.
-
-And if that power exists in places it should not, you have found a real weakness.
-
----
-
-## Why this matters
-
-Attackers do not need the whole machine to be wide open.
-
-They need footholds.
-
-A writable directory in the wrong place.
-A removable file outside normal user-owned space.
-A service path that stayed broader than intended.
-A deployment tree that was never tightened back down.
-A mount that ended up more permissive than anyone realised.
-
-Those are exactly the sorts of weaknesses this tool helps uncover.
-
-It is a **filesystem weakness / permission-drift audit tool**.
-
----
-
-## Default behaviour
-
-Run this:
-
-```bash
-python check_permissions.py
-```
-
-By default, the tool:
-
-- scans from `/`
-- behaves like a best-effort `rm -rf` simulator
-- prints only paths that pass the delete check
-- suppresses paths under the current user’s home directory
-- streams results as it walks
-- exits cleanly if piped into tools like `head`
-- exits cleanly on `Ctrl-C`
-
-So the default scan answers a very direct question:
-
-> **Outside the user’s normal space, what can this account delete right now?**
-
-If it prints nothing, that is usually reassuring.
-
-If it prints something, you have found something worth understanding.
-
----
+It is showing you where that account has filesystem power.
 
 ## Quick start
 
@@ -165,13 +148,24 @@ python check_permissions.py --all-results --format tsv
 python check_permissions.py /etc /var /srv
 ```
 
----
+## Default behaviour
+
+By default, the tool:
+
+- scans from `/`
+- behaves like a best-effort `rm -rf` simulator
+- prints only paths that pass the delete check
+- suppresses paths under the current user’s home directory
+- streams results as it walks
+- exits cleanly if piped into tools like `head`
+- exits cleanly on `Ctrl-C`
+
+That makes the default scan a very strong first-pass audit for permission drift outside normal user-owned space.
 
 ## What it actually checks
 
 This is not a naive “find writable files” script.
-
-It models the things that actually matter on Linux.
+It models the things that actually matter on UNIX/Linux.
 
 ### Delete checks
 
@@ -218,8 +212,6 @@ Disable that behaviour with:
 python check_permissions.py --no-special-fs-unknown
 ```
 
----
-
 ## Output formats
 
 ### `paths` (default)
@@ -235,119 +227,89 @@ Notes:
 
 Prints one JSON object per line.
 
-Example:
-
-```json
-{"status":"WOULD_REMOVE","kind":"file","path":"/tmp/example","reasons":[],"mode":"can_delete_only"}
-```
-
 ### `tsv`
 
-Prints tab-separated output with this header:
+Prints tab-separated fields:
 
-```text
-status    kind    mode    path    reasons
-```
+- `status`
+- `kind`
+- `mode`
+- `path`
+- `reasons`
 
-The `reasons` column is a JSON array inside one TSV field.
-
----
-
-## Status values
-
-Depending on mode, records can have these statuses:
-
-- `WOULD_REMOVE`
-- `WOULD_WRITE`
-- `WOULD_WRITE_OR_DELETE`
-- `WOULD_FAIL`
-- `UNKNOWN`
-- `SKIP`
-
-By default, only the passing status for the selected mode is printed.
-Use `--all-results` to see everything.
-
----
+Use this when you want to inspect failures, unknowns, and the exact reasons behind a result.
 
 ## Useful options
 
-### Exclude paths from scanning
+### `--exclude PATH ...`
+
+Skip specific files or whole directory subtrees before scanning and before output.
+
+Example:
 
 ```bash
-python check_permissions.py / --exclude /proc /sys /run
+python check_permissions.py / --exclude /var/cache /tmp/somefile
 ```
 
-`--exclude` skips matching files and whole directory subtrees before scanning and before output.
-It may be repeated.
+### `--one-file-system`
 
-### Preserve `/`
+Do not descend into entries on a different device.
+
+### `--preserve-root`
+
+Skip `/` entirely, similar in spirit to GNU `rm --preserve-root`.
+
+### `--real-ids`
+
+Use real IDs instead of effective IDs for access checks and sticky-bit ownership tests.
+
+### `--output FILE`
+
+Write results to a file instead of stdout.
+
+Example:
 
 ```bash
-python check_permissions.py --preserve-root /
+python check_permissions.py --all-results --format tsv --output audit.tsv
 ```
 
-Skips `/` itself, similar in spirit to GNU `rm --preserve-root`.
+## Running as root
 
-### Stay on one filesystem
-
-```bash
-python check_permissions.py --one-file-system /
-```
-
-Prevents descent into entries on a different `st_dev`.
-
-### Use real IDs instead of effective IDs
-
-```bash
-python check_permissions.py --real-ids
-```
-
-Uses real IDs for `os.access()` checks and sticky-bit ownership checks, and ignores effective capabilities in this mode.
-
-### Write results to a file
-
-```bash
-python check_permissions.py --all-results --format jsonl --output audit.jsonl
-```
-
----
-
-## Root behaviour
-
-This tool is mainly meant to answer this question:
-
-> **What can a non-root account do on this system that it should not be able to do?**
-
-So if you run it as root **without** `--run-as-root`, it refuses to scan and exits with status `2`.
+By default, the script refuses to run as root.
 
 That is deliberate.
 
-If you really do want a root-context audit, opt in explicitly:
+This tool is primarily meant to audit filesystem permissions from a **non-root user perspective**, because root can write or delete many paths that an ordinary user cannot.
+
+If you really want root-context results, use:
 
 ```bash
-python check_permissions.py --run-as-root --exclude /proc /
+python check_permissions.py --run-as-root --exclude /proc
 ```
 
-Excluding `/proc` is strongly recommended for root scans because it can be noisy and misleading.
+## Scope and limits
 
----
+This tool is designed for UNIX/Linux auditing, triage, and hardening work.
 
-## Important note
+It is strong because it is low impact, but it is still an audit tool, not a magical oracle.
 
-This tool is built to be non-intrusive.
-It does not delete.
-It does not open regular files for writing.
-It audits the filesystem as it stands.
+Reality can still differ because of things like:
 
-That makes it extremely useful for live-system review, hardening work, service-account audits, and general security sanity checks.
+- SELinux, AppArmor, or Landlock
+- races during the scan
+- unusual FUSE or NFS behaviour
+- namespace differences
+- kernel or filesystem-specific behaviour
 
-There can still be edge cases on unusual filesystems or under external security controls, which is why `UNKNOWN` exists and why special filesystems are handled conservatively.
-But the core purpose of this tool is not fuzzy:
+That does **not** make the tool weak.
+It just means you should use it the way it was meant to be used: as a serious, safe audit of the filesystem from a user account’s point of view.
 
-> **find places where an account has filesystem power that it should not have**
+## Summary
 
----
+`check_permissions.py` does three valuable things well:
 
-## In one sentence
+- it **does no harm**
+- it **changes nothing**
+- it **detects drift**
 
-`check_permissions.py` is a **safe, non-intrusive UNIX/Linux filesystem audit tool** for finding the places where a user account can write or delete outside the tight boundaries it should normally be limited to.
+And that makes it a very practical way to audit a UNIX/Linux filesystem for the quiet permission weaknesses that should not really be there, but over time often are.
