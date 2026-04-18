@@ -2,6 +2,8 @@
 
 Best-effort **Linux security auditing tool** for recursively identifying paths that appear **deletable**, **writable**, or **writable-or-deletable** — **without actually deleting anything and without opening regular files for writing**.
 
+**This TOOL is ENTIRELY NON-HARMFUL**
+
 For regular files, the tool is designed to avoid changing:
 - file contents
 - size
