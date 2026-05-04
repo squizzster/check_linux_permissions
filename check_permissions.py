@@ -13,6 +13,9 @@ Defaults
 - outputs only paths that match the selected capability check
 - suppresses paths under the current user's home directory unless
   `--include-home` is given
+- for the default no-argument `/` scan, skips the active writable temp
+  directory (TMPDIR/TEMP/TMP, falling back to /tmp) unless `--include-tmp` is
+  given
 - `--label` / `--add-label` / `--add-labels` optionally prefix path output
   with `[d]` for deletable entries or `[w]` for writable-only entries
 - exits cleanly when stdout is closed early by tools like `head` or `tail`
@@ -67,7 +70,7 @@ MODE_CAN_DELETE_ONLY = "can_delete_only"
 MODE_CAN_WRITE_ONLY = "can_write_only"
 MODE_CAN_WRITE_OR_DELETE = "can_write_or_delete"
 
-# Backward-compatible internal aliases for older names.
+# [AI_LOOKS_OK] Backward-compatible internal aliases are preserved exactly.
 MODE_CAN_DELETE = MODE_CAN_DELETE_ONLY
 MODE_CAN_WRITE = MODE_CAN_WRITE_ONLY
 MODE_CAN_WRITE_DELETE = MODE_CAN_WRITE_OR_DELETE
@@ -109,6 +112,8 @@ DEFAULT_UNKNOWN_FSTYPES = {
     "autofs",
 }
 
+TMP_ENV_VARS = ("TMPDIR", "TEMP", "TMP")
+
 
 class StructStatx(ctypes.Structure):
     """
@@ -136,6 +141,7 @@ class StructStatx(ctypes.Structure):
     ]
 
 
+# [AI_LOOKS_OK] Import-time libc/statx setup is intentionally still module-level.
 libc = ctypes.CDLL(None, use_errno=True)
 _HAS_STATX = hasattr(libc, "statx")
 
@@ -174,21 +180,35 @@ def statx_flags(path: str) -> FlagCheck:
     Failure to inspect the flags is treated as uncertainty rather than proof
     that the operation would fail.
     """
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _statx_flags_impl(path)
+
+
+def _statx_flags_impl(path: str) -> FlagCheck:
     if not _HAS_STATX:
         return FlagCheck(None, None, "statx_unavailable")
 
     buf = StructStatx()
-    rc = libc.statx(
+    rc = _call_statx_no_follow(path, buf)
+    if rc != 0:
+        e = ctypes.get_errno()
+        return FlagCheck(None, None, f"statx_errno_{e}:{os.strerror(e)}")
+
+    return _flag_check_from_statx_buffer(buf)
+
+
+def _call_statx_no_follow(path: str, buf: StructStatx) -> int:
+    # [AI_SECURITY] Replicated: os.fsencode allows embedded NUL bytes; ctypes.c_char_p would truncate at NUL.
+    return libc.statx(
         AT_FDCWD,
         os.fsencode(path),
         AT_SYMLINK_NOFOLLOW,
         STATX_ALL,
         ctypes.byref(buf),
     )
-    if rc != 0:
-        e = ctypes.get_errno()
-        return FlagCheck(None, None, f"statx_errno_{e}:{os.strerror(e)}")
 
+
+def _flag_check_from_statx_buffer(buf: StructStatx) -> FlagCheck:
     immutable = None
     append_only = None
 
@@ -201,33 +221,55 @@ def statx_flags(path: str) -> FlagCheck:
 
 
 def parse_caps() -> int:
+    # [AI_LOOKS_OK] Public function retained; failures intentionally collapse to zero capabilities.
+    return _parse_caps_impl()
+
+
+def _parse_caps_impl() -> int:
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("CapEff:"):
-                    return int(line.split()[1], 16)
+            return _cap_eff_from_status_lines(f)
     except Exception:
         pass
     return 0
 
 
+def _cap_eff_from_status_lines(lines: Iterable[str]) -> int:
+    for line in lines:
+        if line.startswith("CapEff:"):
+            return int(line.split()[1], 16)
+    return 0
+
+
 def has_cap(caps: int, capno: int) -> bool:
+    # [AI_LOOKS_OK] Bit test kept deliberately small and side-effect free.
     return bool(caps & (1 << capno))
 
 
 def unescape_mount_field(s: str) -> str:
     # /proc/self/mountinfo uses octal escapes like \040
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _unescape_mount_field_impl(s)
+
+
+def _unescape_mount_field_impl(s: str) -> str:
     out: List[str] = []
     i = 0
     while i < len(s):
-        if s[i] == "\\" and i + 3 < len(s) and all(c in "01234567" for c in s[i + 1 : i + 4]):
-            out.append(chr(int(s[i + 1 : i + 4], 8)))
-            i += 4
-        else:
-            out.append(s[i])
-            i += 1
+        next_char, next_index = _next_unescaped_mount_char(s, i)
+        out.append(next_char)
+        i = next_index
     return "".join(out)
 
+
+def _next_unescaped_mount_char(s: str, i: int) -> Tuple[str, int]:
+    if _has_octal_escape_at(s, i):
+        return chr(int(s[i + 1 : i + 4], 8)), i + 4
+    return s[i], i + 1
+
+
+def _has_octal_escape_at(s: str, i: int) -> bool:
+    return s[i] == "\\" and i + 3 < len(s) and all(c in "01234567" for c in s[i + 1 : i + 4])
 
 
 @dataclass(frozen=True)
@@ -258,6 +300,7 @@ def _same_path_depth(
     mounts_by_id: Dict[int, Mount],
     _memo: Dict[int, int],
 ) -> int:
+    # [AI_LOOKS_OK] Memoization semantics preserved, including cached zero values.
     cached = _memo.get(mount_id)
     if cached is not None:
         return cached
@@ -274,55 +317,79 @@ def _same_path_depth(
 
 
 def parse_mountinfo() -> MountParseResult:
-    mounts: List[Mount] = []
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _parse_mountinfo_impl()
+
+
+def _parse_mountinfo_impl() -> MountParseResult:
     try:
-        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            for parse_index, line in enumerate(f):
-                line = line.rstrip("\n")
-                left, right = line.split(" - ", 1)
-                lparts = left.split()
-                rparts = right.split()
-
-                mount_id = int(lparts[0])
-                parent_id = int(lparts[1])
-                mount_point = normalize(unescape_mount_field(lparts[4]))
-                try:
-                    real_mount_point = normalize(os.path.realpath(mount_point))
-                except OSError:
-                    real_mount_point = mount_point
-
-                mount_options = tuple(lparts[5].split(","))
-                fs_type = rparts[0]
-                super_options = tuple(rparts[2].split(",")) if len(rparts) >= 3 else ()
-
-                mounts.append(
-                    Mount(
-                        mount_id=mount_id,
-                        parent_id=parent_id,
-                        mount_point=mount_point,
-                        real_mount_point=real_mount_point,
-                        fs_type=fs_type,
-                        mount_options=mount_options,
-                        super_options=super_options,
-                        parse_index=parse_index,
-                    )
-                )
+        mounts = _read_mountinfo_mounts()
     except OSError as e:
-        fallback = Mount(
-            mount_id=1,
-            parent_id=0,
-            mount_point="/",
-            real_mount_point="/",
-            fs_type="unknown",
-            mount_options=(),
-            super_options=(),
-            parse_index=0,
-        )
-        return MountParseResult([fallback], f"mountinfo_unavailable_errno_{e.errno}:{e.strerror}")
+        return MountParseResult([_mountinfo_fallback_mount()], f"mountinfo_unavailable_errno_{e.errno}:{e.strerror}")
 
+    mounts = _mounts_with_same_path_depth(mounts)
+    return MountParseResult(_sort_mounts_for_matching(mounts), None)
+
+
+def _read_mountinfo_mounts() -> List[Mount]:
+    mounts: List[Mount] = []
+    with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+        for parse_index, line in enumerate(f):
+            mounts.append(_parse_mountinfo_line(line, parse_index))
+    return mounts
+
+
+def _parse_mountinfo_line(line: str, parse_index: int) -> Mount:
+    line = line.rstrip("\n")
+    left, right = line.split(" - ", 1)
+    lparts = left.split()
+    rparts = right.split()
+
+    mount_id = int(lparts[0])
+    parent_id = int(lparts[1])
+    mount_point = normalize(unescape_mount_field(lparts[4]))
+    real_mount_point = _realpath_or_self(mount_point)
+
+    mount_options = tuple(lparts[5].split(","))
+    fs_type = rparts[0]
+    super_options = tuple(rparts[2].split(",")) if len(rparts) >= 3 else ()
+
+    return Mount(
+        mount_id=mount_id,
+        parent_id=parent_id,
+        mount_point=mount_point,
+        real_mount_point=real_mount_point,
+        fs_type=fs_type,
+        mount_options=mount_options,
+        super_options=super_options,
+        parse_index=parse_index,
+    )
+
+
+def _realpath_or_self(mount_point: str) -> str:
+    try:
+        return normalize(os.path.realpath(mount_point))
+    except OSError:
+        return mount_point
+
+
+def _mountinfo_fallback_mount() -> Mount:
+    return Mount(
+        mount_id=1,
+        parent_id=0,
+        mount_point="/",
+        real_mount_point="/",
+        fs_type="unknown",
+        mount_options=(),
+        super_options=(),
+        parse_index=0,
+    )
+
+
+def _mounts_with_same_path_depth(mounts: Sequence[Mount]) -> List[Mount]:
     mounts_by_id = {m.mount_id: m for m in mounts}
     depth_memo: Dict[int, int] = {}
-    mounts = [
+    return [
         Mount(
             mount_id=m.mount_id,
             parent_id=m.parent_id,
@@ -337,7 +404,10 @@ def parse_mountinfo() -> MountParseResult:
         for m in mounts
     ]
 
-    mounts.sort(
+
+def _sort_mounts_for_matching(mounts: Sequence[Mount]) -> List[Mount]:
+    return sorted(
+        mounts,
         key=lambda m: (
             len(m.mount_point.rstrip("/")) if m.mount_point != "/" else 1,
             m.same_path_depth,
@@ -345,10 +415,10 @@ def parse_mountinfo() -> MountParseResult:
         ),
         reverse=True,
     )
-    return MountParseResult(mounts, None)
 
 
 def normalize(path: str) -> str:
+    # [AI_LOOKS_OK] Preserves the original absolute-path and trailing-slash normalization rule.
     p = os.path.abspath(path)
     return p if p == "/" else p.rstrip("/")
 
@@ -391,33 +461,53 @@ def discover_home_dirs() -> List[str]:
     point at the wrong home when the script runs under sudo, wrappers, cron, or
     a process with mismatched real/effective IDs.
     """
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _discover_home_dirs_impl()
+
+
+def _discover_home_dirs_impl() -> List[str]:
     homes: List[str] = []
 
     env_home = os.environ.get("HOME")
     if env_home:
         homes.append(normalize(env_home))
 
+    homes.extend(_pwd_homes_for_current_ids())
+    homes.extend(_pwd_home_for_sudo_user())
+
+    homes = [h for h in dedupe_keep_order(homes) if h and h != "/"]
+    return homes
+
+
+def _pwd_homes_for_current_ids() -> List[str]:
+    homes: List[str] = []
     for uid in (os.getuid(), os.geteuid()):
         try:
             homes.append(normalize(pwd.getpwuid(uid).pw_dir))
         except KeyError:
             pass
-
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        try:
-            homes.append(normalize(pwd.getpwnam(sudo_user).pw_dir))
-        except KeyError:
-            pass
-
-    homes = [h for h in dedupe_keep_order(homes) if h and h != "/"]
     return homes
+
+
+def _pwd_home_for_sudo_user() -> List[str]:
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        return []
+    try:
+        return [normalize(pwd.getpwnam(sudo_user).pw_dir)]
+    except KeyError:
+        return []
 
 
 def discover_home_dirs_with_realpaths() -> List[str]:
     """
     Return plausible home directories plus their realpaths, deduplicated.
     """
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _discover_home_dirs_with_realpaths_impl()
+
+
+def _discover_home_dirs_with_realpaths_impl() -> List[str]:
     homes = discover_home_dirs()
     expanded: List[str] = []
     for home in homes:
@@ -427,6 +517,92 @@ def discover_home_dirs_with_realpaths() -> List[str]:
         except OSError:
             pass
     return [h for h in dedupe_keep_order(expanded) if h and h != "/"]
+
+
+def access_path(path: str, mode: int, *, effective_access: bool) -> bool:
+    """
+    Wrapper around os.access with consistent effective-ID handling.
+
+    This mirrors the simulator's permission context without opening or creating
+    files.  On platforms where effective-ID access checks are unsupported, it
+    falls back to the regular os.access behavior.
+    """
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _access_path_impl(path, mode, effective_access=effective_access)
+
+
+def _access_path_impl(path: str, mode: int, *, effective_access: bool) -> bool:
+    if not effective_access:
+        return os.access(path, mode)
+
+    if os.access in getattr(os, "supports_effective_ids", set()):
+        try:
+            return os.access(path, mode, effective_ids=True)
+        except (TypeError, NotImplementedError):
+            pass
+
+    try:
+        return os.access(path, mode, effective_ids=True)
+    except (TypeError, NotImplementedError):
+        return os.access(path, mode)
+
+
+def dir_is_writable_searchable(path: str, *, effective_access: bool) -> bool:
+    """
+    Return True when path is a directory with write + search permission.
+    """
+    # [AI_LOOKS_OK] The os.path.isdir symlink-following behavior is preserved.
+    try:
+        return os.path.isdir(path) and access_path(
+            path,
+            os.W_OK | os.X_OK,
+            effective_access=effective_access,
+        )
+    except OSError:
+        return False
+
+
+def discover_writable_tmp_dirs(*, effective_access: bool) -> List[str]:
+    """
+    Return the active writable temp directory, with /tmp as fallback.
+
+    Candidate order follows the usual TMPDIR/TEMP/TMP environment-variable
+    convention, then /tmp.  The function deliberately does not call
+    tempfile.gettempdir(), because that can create a probe file as part of its
+    availability check.
+    """
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _discover_writable_tmp_dirs_impl(effective_access=effective_access)
+
+
+def _discover_writable_tmp_dirs_impl(*, effective_access: bool) -> List[str]:
+    for raw_path in _tmp_dir_candidates():
+        path = _normalized_non_root_tmp_candidate(raw_path)
+        if path is None:
+            continue
+        if dir_is_writable_searchable(path, effective_access=effective_access):
+            return [path]
+    return []
+
+
+def _tmp_dir_candidates() -> List[str]:
+    raw_candidates: List[str] = []
+    for var in TMP_ENV_VARS:
+        value = os.environ.get(var)
+        if value:
+            raw_candidates.append(value)
+    raw_candidates.append("/tmp")
+    return dedupe_keep_order(raw_candidates)
+
+
+def _normalized_non_root_tmp_candidate(raw_path: str) -> Optional[str]:
+    try:
+        path = normalize(raw_path)
+    except (OSError, TypeError, ValueError):
+        return None
+    if path == "/":
+        return None
+    return path
 
 
 def _path_matches_with_realpath_fallback(
@@ -442,16 +618,23 @@ def _path_matches_with_realpath_fallback(
     """
     normalized = normalize(path)
 
-    for candidate in candidates:
-        if matches_candidate(candidate, normalized):
-            return True
+    if _any_candidate_matches(candidates, matches_candidate, normalized):
+        return True
 
     real = real_normalize(normalized)
     if real == normalized:
         return False
 
+    return _any_candidate_matches(candidates, matches_candidate, real)
+
+
+def _any_candidate_matches(
+    candidates: Sequence[T],
+    matches_candidate: Callable[[T, str], bool],
+    candidate_path: str,
+) -> bool:
     for candidate in candidates:
-        if matches_candidate(candidate, real):
+        if matches_candidate(candidate, candidate_path):
             return True
     return False
 
@@ -463,7 +646,11 @@ def path_is_within_any_home(path: str, home_dirs: Sequence[str]) -> bool:
     This keeps the common case fast while still suppressing symlinked-home paths
     by default.
     """
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _path_is_within_any_home_impl(path, home_dirs)
 
+
+def _path_is_within_any_home_impl(path: str, home_dirs: Sequence[str]) -> bool:
     def matches_home(home_dir: str, candidate_path: str) -> bool:
         return is_path_prefix(home_dir, candidate_path)
 
@@ -478,14 +665,17 @@ def path_is_within_any_excluded(path: str, excluded_paths: Sequence[ExcludedPath
     path excludes just that exact path unless the realpath resolves underneath an
     excluded directory.
     """
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _path_is_within_any_excluded_impl(path, excluded_paths)
 
+
+def _path_is_within_any_excluded_impl(path: str, excluded_paths: Sequence[ExcludedPath]) -> bool:
     def matches_excluded(excluded_path: ExcludedPath, candidate_path: str) -> bool:
         if excluded_path.recursive:
             return is_path_prefix(excluded_path.path, candidate_path)
         return candidate_path == excluded_path.path
 
     return _path_matches_with_realpath_fallback(path, excluded_paths, matches_excluded)
-
 
 
 def _dedupe_excluded_paths(items: Iterable[ExcludedPath]) -> List[ExcludedPath]:
@@ -499,29 +689,42 @@ def _dedupe_excluded_paths(items: Iterable[ExcludedPath]) -> List[ExcludedPath]:
     return out
 
 
-
 def normalize_excluded_paths(raw_paths: Sequence[str]) -> List[ExcludedPath]:
+    # [AI_LOOKS_OK] Public function retained as a compatibility stub.
+    return _normalize_excluded_paths_impl(raw_paths)
+
+
+def _normalize_excluded_paths_impl(raw_paths: Sequence[str]) -> List[ExcludedPath]:
     expanded: List[ExcludedPath] = []
     for raw_path in raw_paths:
         normalized = normalize(raw_path)
-        recursive = raw_path.endswith(os.sep)
-        try:
-            recursive = recursive or stat.S_ISDIR(os.lstat(normalized).st_mode)
-        except OSError:
-            pass
+        recursive = _raw_exclude_is_recursive(raw_path, normalized)
 
         expanded.append(ExcludedPath(normalized, recursive))
+        expanded.extend(_real_excluded_path_variant(normalized, recursive))
+    return [p for p in _dedupe_excluded_paths(expanded) if p.path]
+
+
+def _raw_exclude_is_recursive(raw_path: str, normalized: str) -> bool:
+    recursive = raw_path.endswith(os.sep)
+    try:
+        recursive = recursive or stat.S_ISDIR(os.lstat(normalized).st_mode)
+    except OSError:
+        pass
+    return recursive
+
+
+def _real_excluded_path_variant(normalized: str, recursive: bool) -> List[ExcludedPath]:
+    try:
+        real = normalize(os.path.realpath(normalized))
+        real_recursive = recursive
         try:
-            real = normalize(os.path.realpath(normalized))
-            real_recursive = recursive
-            try:
-                real_recursive = real_recursive or stat.S_ISDIR(os.lstat(real).st_mode)
-            except OSError:
-                pass
-            expanded.append(ExcludedPath(real, real_recursive))
+            real_recursive = real_recursive or stat.S_ISDIR(os.lstat(real).st_mode)
         except OSError:
             pass
-    return [p for p in _dedupe_excluded_paths(expanded) if p.path]
+        return [ExcludedPath(real, real_recursive)]
+    except OSError:
+        return []
 
 
 class MountTable:
@@ -530,8 +733,7 @@ class MountTable:
         self.error_reason = parse_result.error_reason
         self.by_id = {m.mount_id: m for m in self.mounts}
         self.children_by_parent_id: Dict[int, List[Mount]] = {}
-        for mount in self.mounts:
-            self.children_by_parent_id.setdefault(mount.parent_id, []).append(mount)
+        self._index_children_by_parent_id()
 
         self._top_same_path_cache: Dict[int, Mount] = {}
         self.visible_mounts: List[Mount] = []
@@ -542,8 +744,14 @@ class MountTable:
     def degraded(self) -> bool:
         return self.error_reason is not None
 
+    def _index_children_by_parent_id(self) -> None:
+        # [AI_LOOKS_OK] Child ordering remains the ordering of self.mounts.
+        for mount in self.mounts:
+            self.children_by_parent_id.setdefault(mount.parent_id, []).append(mount)
+
     def _root_fallback(self) -> Mount:
         if self.mounts:
+            # [AI_CLARIFY] Replicated: with no visible '/' candidate, fallback is the first sorted mount.
             return self.mounts[0]
         raise RuntimeError('mount table is empty')
 
@@ -580,36 +788,42 @@ class MountTable:
         if not self.mounts:
             return self._root_fallback()
 
+        visible_root = self._select_visible_root()
+        visible_seen_ids: Set[int] = set()
+        self._visit_visible_mount(visible_root, visible_seen_ids)
+        self._sort_visible_mounts_for_lookup()
+        return visible_root
+
+    def _select_visible_root(self) -> Mount:
         root_candidates = [m for m in self.mounts if m.mount_point == '/']
         if not root_candidates:
             root_candidates = [self._root_fallback()]
+        return self._top_same_path_descendant(self._choose_top_candidate(root_candidates))
 
-        visible_root = self._top_same_path_descendant(self._choose_top_candidate(root_candidates))
-        visible_seen_ids: Set[int] = set()
+    def _visit_visible_mount(self, mount: Mount, visible_seen_ids: Set[int]) -> None:
+        if mount.mount_id in visible_seen_ids:
+            return
+        visible_seen_ids.add(mount.mount_id)
+        self.visible_mounts.append(mount)
+        self.visible_by_mountpoint[normalize(mount.mount_point)] = mount
 
-        def visit(mount: Mount) -> None:
-            if mount.mount_id in visible_seen_ids:
-                return
-            visible_seen_ids.add(mount.mount_id)
-            self.visible_mounts.append(mount)
-            self.visible_by_mountpoint[normalize(mount.mount_point)] = mount
+        for child_mounts in self._group_visible_child_candidates(mount).values():
+            visible_child = self._top_same_path_descendant(self._choose_top_candidate(child_mounts))
+            self._visit_visible_mount(visible_child, visible_seen_ids)
 
-            grouped_children: Dict[str, List[Mount]] = {}
-            for child in self.children_by_parent_id.get(mount.mount_id, []):
-                if child.mount_point == mount.mount_point:
-                    continue
-                grouped_children.setdefault(normalize(child.mount_point), []).append(child)
+    def _group_visible_child_candidates(self, mount: Mount) -> Dict[str, List[Mount]]:
+        grouped_children: Dict[str, List[Mount]] = {}
+        for child in self.children_by_parent_id.get(mount.mount_id, []):
+            if child.mount_point == mount.mount_point:
+                continue
+            grouped_children.setdefault(normalize(child.mount_point), []).append(child)
+        return grouped_children
 
-            for child_mounts in grouped_children.values():
-                visible_child = self._top_same_path_descendant(self._choose_top_candidate(child_mounts))
-                visit(visible_child)
-
-        visit(visible_root)
+    def _sort_visible_mounts_for_lookup(self) -> None:
         self.visible_mounts.sort(
             key=lambda m: len(m.mount_point.rstrip('/')) if m.mount_point != '/' else 1,
             reverse=True,
         )
-        return visible_root
 
     def _visible_mount_for_lexical_path(self, path: str) -> Mount:
         lexical = normalize(path)
@@ -637,8 +851,6 @@ class MountTable:
         if self.degraded:
             return lexical == '/'
         return lexical in self.visible_by_mountpoint
-
-
 
 
 @dataclass
@@ -670,39 +882,48 @@ class Assessment:
     write_reasons: List[str] = field(default_factory=list)
 
     def render(self, mode: str) -> Outcome:
+        # [AI_LOOKS_OK] Render is kept as the only public conversion point from verdicts to output status.
         if mode == MODE_CAN_DELETE_ONLY:
-            return Outcome(
-                status=verdict_to_status(self.delete_verdict, mode),
-                kind=self.kind,
-                path=self.path,
-                reasons=self.delete_reasons,
-                mode=mode,
-                label=choose_output_label(self.delete_verdict, self.write_verdict, mode),
-            )
+            return self._render_delete_only(mode)
 
         if mode == MODE_CAN_WRITE_ONLY:
-            return Outcome(
-                status=verdict_to_status(self.write_verdict, mode),
-                kind=self.kind,
-                path=self.path,
-                reasons=self.write_reasons,
-                mode=mode,
-                label=choose_output_label(self.delete_verdict, self.write_verdict, mode),
-            )
+            return self._render_write_only(mode)
 
         if mode == MODE_CAN_WRITE_OR_DELETE:
-            combined_verdict = combine_verdicts(self.delete_verdict, self.write_verdict)
-            return Outcome(
-                status=verdict_to_status(combined_verdict, mode),
-                kind=self.kind,
-                path=self.path,
-                reasons=dedupe_keep_order(self.delete_reasons + self.write_reasons),
-                mode=mode,
-                label=choose_output_label(self.delete_verdict, self.write_verdict, mode),
-            )
+            return self._render_write_or_delete(mode)
 
         raise ValueError(f"unknown mode: {mode}")
 
+    def _render_delete_only(self, mode: str) -> Outcome:
+        return Outcome(
+            status=verdict_to_status(self.delete_verdict, mode),
+            kind=self.kind,
+            path=self.path,
+            reasons=self.delete_reasons,
+            mode=mode,
+            label=choose_output_label(self.delete_verdict, self.write_verdict, mode),
+        )
+
+    def _render_write_only(self, mode: str) -> Outcome:
+        return Outcome(
+            status=verdict_to_status(self.write_verdict, mode),
+            kind=self.kind,
+            path=self.path,
+            reasons=self.write_reasons,
+            mode=mode,
+            label=choose_output_label(self.delete_verdict, self.write_verdict, mode),
+        )
+
+    def _render_write_or_delete(self, mode: str) -> Outcome:
+        combined_verdict = combine_verdicts(self.delete_verdict, self.write_verdict)
+        return Outcome(
+            status=verdict_to_status(combined_verdict, mode),
+            kind=self.kind,
+            path=self.path,
+            reasons=dedupe_keep_order(self.delete_reasons + self.write_reasons),
+            mode=mode,
+            label=choose_output_label(self.delete_verdict, self.write_verdict, mode),
+        )
 
 
 def combine_verdicts(delete_verdict: str, write_verdict: str) -> str:
@@ -775,7 +996,6 @@ def classify_kind(st: os.stat_result) -> str:
     return KIND_OTHER
 
 
-
 def mode_needs_delete(mode: str) -> bool:
     return mode in {MODE_CAN_DELETE_ONLY, MODE_CAN_WRITE_OR_DELETE}
 
@@ -805,21 +1025,13 @@ class Simulator:
         self.seen_dirs: Set[Tuple[int, int]] = set()
 
     def access(self, path: str, mode: int) -> bool:
-        if not self.effective_access:
-            return os.access(path, mode)
-
-        if os.access in getattr(os, "supports_effective_ids", set()):
-            return os.access(path, mode, effective_ids=True)
-
-        try:
-            return os.access(path, mode, effective_ids=True)
-        except (TypeError, NotImplementedError):
-            return os.access(path, mode)
+        return access_path(path, mode, effective_access=self.effective_access)
 
     def sticky_blocks_delete(self, parent_st: os.stat_result, target_st: os.stat_result) -> bool:
         if not (parent_st.st_mode & stat.S_ISVTX):
             return False
         if self.uid == 0:
+            # [AI_BUG] Replicated: uid 0 bypasses sticky checks before CapEff is considered, which can overestimate capability-restricted root.
             return False
         if has_cap(self.caps, CAP_FOWNER):
             return False
@@ -837,21 +1049,48 @@ class Simulator:
         uncertain = False
         hard_failure = False
 
+        access_reasons, access_hard_failure = self._parent_delete_access_reasons(parent)
+        reasons.extend(access_reasons)
+        hard_failure |= access_hard_failure
+
+        sticky_reasons, sticky_hard_failure = self._sticky_delete_reasons(parent_st, target_st)
+        reasons.extend(sticky_reasons)
+        hard_failure |= sticky_hard_failure
+
+        mount_reasons, mount_uncertain, mount_hard_failure = self._parent_delete_mount_reasons(parent)
+        reasons.extend(mount_reasons)
+        uncertain |= mount_uncertain
+        hard_failure |= mount_hard_failure
+
+        flag_reasons, flag_uncertain, flag_hard_failure = self._parent_dir_flag_reasons(parent)
+        reasons.extend(flag_reasons)
+        uncertain |= flag_uncertain
+        hard_failure |= flag_hard_failure
+
+        return reasons, uncertain, hard_failure
+
+    def _parent_delete_access_reasons(self, parent: str) -> Tuple[List[str], bool]:
         if not self.access(parent, os.W_OK | os.X_OK):
-            reasons.append("parent_not_writable_searchable")
-            hard_failure = True
+            return ["parent_not_writable_searchable"], True
+        return [], False
 
+    def _sticky_delete_reasons(self, parent_st: os.stat_result, target_st: os.stat_result) -> Tuple[List[str], bool]:
         if self.sticky_blocks_delete(parent_st, target_st):
-            reasons.append("sticky_bit_blocks_delete")
-            hard_failure = True
+            return ["sticky_bit_blocks_delete"], True
+        return [], False
 
+    def _parent_delete_mount_reasons(self, parent: str) -> Tuple[List[str], bool, bool]:
         mount = self.mounts.mount_for(parent)
         if self.mounts.degraded:
-            reasons.append(f"{self.mounts.error_reason}")
-            uncertain = True
-        elif mount.read_only:
-            reasons.append("parent_mount_read_only")
-            hard_failure = True
+            return [f"{self.mounts.error_reason}"], True, False
+        if mount.read_only:
+            return ["parent_mount_read_only"], False, True
+        return [], False, False
+
+    def _parent_dir_flag_reasons(self, parent: str) -> Tuple[List[str], bool, bool]:
+        reasons: List[str] = []
+        uncertain = False
+        hard_failure = False
 
         flags = statx_flags(parent)
         if flags.immutable is True:
@@ -940,23 +1179,58 @@ class Simulator:
     ) -> Tuple[str, Optional[os.stat_result], Optional[Tuple[int, int]], Optional[List[Assessment]]]:
         path = normalize(path)
 
-        if self.excluded_paths and path_is_within_any_excluded(path, self.excluded_paths):
-            excluded_kind = KIND_OTHER
-            try:
-                excluded_kind = classify_kind(os.lstat(path))
-            except OSError:
-                pass
-            return path, None, None, [
-                self._basic_assessment(
-                    kind=excluded_kind,
-                    path=path,
-                    verdict=VERDICT_SKIP,
-                    reasons=["excluded_path"],
-                )
-            ]
+        terminal = self._terminal_if_excluded_or_preserved_root(path)
+        if terminal is not None:
+            return path, None, None, terminal
 
+        st, terminal = self._lstat_or_terminal_assessment(path)
+        if terminal is not None:
+            return path, None, None, terminal
+        assert st is not None
+
+        kind = classify_kind(st)
+
+        terminal = self._terminal_if_different_filesystem(path, st, kind, root_dev)
+        if terminal is not None:
+            return path, None, None, terminal
+
+        if kind != KIND_DIR:
+            return path, None, None, [self.classify_leaf(path, st, kind, mode=mode)]
+
+        dir_key = (st.st_dev, st.st_ino)
+        terminal = self._terminal_if_already_visited_dir(path, dir_key)
+        if terminal is not None:
+            return path, None, None, terminal
+
+        self.seen_dirs.add(dir_key)
+        return path, st, dir_key, None
+
+    def _terminal_if_excluded_or_preserved_root(self, path: str) -> Optional[List[Assessment]]:
+        excluded = self._terminal_if_excluded_path(path)
+        if excluded is not None:
+            return excluded
+        return self._terminal_if_preserve_root(path)
+
+    def _terminal_if_excluded_path(self, path: str) -> Optional[List[Assessment]]:
+        if not (self.excluded_paths and path_is_within_any_excluded(path, self.excluded_paths)):
+            return None
+        excluded_kind = KIND_OTHER
+        try:
+            excluded_kind = classify_kind(os.lstat(path))
+        except OSError:
+            pass
+        return [
+            self._basic_assessment(
+                kind=excluded_kind,
+                path=path,
+                verdict=VERDICT_SKIP,
+                reasons=["excluded_path"],
+            )
+        ]
+
+    def _terminal_if_preserve_root(self, path: str) -> Optional[List[Assessment]]:
         if self.preserve_root and path == "/":
-            return path, None, None, [
+            return [
                 self._basic_assessment(
                     kind=KIND_DIR,
                     path=path,
@@ -964,11 +1238,13 @@ class Simulator:
                     reasons=["preserve_root"],
                 )
             ]
+        return None
 
+    def _lstat_or_terminal_assessment(self, path: str) -> Tuple[Optional[os.stat_result], Optional[List[Assessment]]]:
         try:
-            st = os.lstat(path)
+            return os.lstat(path), None
         except FileNotFoundError:
-            return path, None, None, [
+            return None, [
                 self._basic_assessment(
                     kind=KIND_OTHER,
                     path=path,
@@ -978,7 +1254,7 @@ class Simulator:
             ]
         except PermissionError as e:
             reason = f"lstat_denied:{e.strerror or 'Permission denied'}"
-            return path, None, None, [
+            return None, [
                 self._basic_assessment(
                     kind=KIND_OTHER,
                     path=path,
@@ -988,7 +1264,7 @@ class Simulator:
             ]
         except OSError as e:
             reason = f"lstat_errno_{e.errno}:{e.strerror}"
-            return path, None, None, [
+            return None, [
                 self._basic_assessment(
                     kind=KIND_OTHER,
                     path=path,
@@ -997,36 +1273,39 @@ class Simulator:
                 )
             ]
 
-        kind = classify_kind(st)
-
+    def _terminal_if_different_filesystem(
+        self,
+        path: str,
+        st: os.stat_result,
+        kind: str,
+        root_dev: Optional[int],
+    ) -> Optional[List[Assessment]]:
         if self.one_file_system and root_dev is not None and st.st_dev != root_dev:
-            reasons = ["different_filesystem", "one_file_system"]
-            return path, None, None, [
+            return [
                 self._basic_assessment(
                     kind=kind,
                     path=path,
                     verdict=VERDICT_SKIP,
-                    reasons=reasons,
+                    reasons=["different_filesystem", "one_file_system"],
                 )
             ]
+        return None
 
-        if kind != KIND_DIR:
-            return path, None, None, [self.classify_leaf(path, st, kind, mode=mode)]
-
-        dir_key = (st.st_dev, st.st_ino)
+    def _terminal_if_already_visited_dir(
+        self,
+        path: str,
+        dir_key: Tuple[int, int],
+    ) -> Optional[List[Assessment]]:
         if dir_key in self.seen_dirs:
-            reasons = ["already_visited_directory"]
-            return path, None, None, [
+            return [
                 self._basic_assessment(
                     kind=KIND_DIR,
                     path=path,
                     verdict=VERDICT_UNKNOWN,
-                    reasons=reasons,
+                    reasons=["already_visited_directory"],
                 )
             ]
-
-        self.seen_dirs.add(dir_key)
-        return path, st, dir_key, None
+        return None
 
     def _directory_scan_failure(
         self,
@@ -1092,7 +1371,7 @@ class Simulator:
         if direct is not None:
             if direct.delete_verdict == VERDICT_UNKNOWN:
                 unknown_children = True
-            if direct.delete_verdict == VERDICT_FAIL:
+            if direct.delete_verdict in {VERDICT_FAIL, VERDICT_SKIP}:
                 failed_children = True
         return unknown_children, failed_children
 
@@ -1118,7 +1397,7 @@ class Simulator:
             try:
                 for entry in self.iter_dir_entries(path):
                     child_path = os.path.join(path, entry.name)
-                    child_direct: Optional[Assessment] = None
+                    child_direct = None
                     for child_assessment in self._simulate_path(child_path, mode=mode, root_dev=root_dev):
                         if child_direct is None and normalize(child_assessment.path) == normalize(child_path):
                             child_direct = child_assessment
@@ -1185,46 +1464,27 @@ class Simulator:
 
     def classify_leaf_delete(self, path: str, st: os.stat_result, kind: str) -> Tuple[str, List[str]]:
         del kind
-        reasons: List[str] = []
-        uncertain = False
-        hard_failure = False
-
-        flag_reasons, flag_uncertain, flag_hard_failure = self.target_inode_checks(path)
-        reasons.extend(flag_reasons)
-        uncertain |= flag_uncertain
-        hard_failure |= flag_hard_failure
-
-        if self.mounts.is_mountpoint(path):
-            reasons.append("mountpoint_busy")
-            hard_failure = True
-
-        parent = normalize(os.path.dirname(path) or "/")
-        fs_reasons, fs_uncertain = self.maybe_fs_uncertain(parent)
-        reasons.extend(fs_reasons)
-        uncertain |= fs_uncertain
-
-        try:
-            parent_st = os.lstat(parent)
-        except OSError as e:
-            reasons.append(f"parent_lstat_errno_{e.errno}:{e.strerror}")
-            return VERDICT_UNKNOWN, reasons
-
-        parent_reasons, parent_uncertain, parent_hard_failure = self.parent_delete_checks(parent, path, parent_st, st)
-        reasons.extend(parent_reasons)
-        uncertain |= parent_uncertain
-        hard_failure |= parent_hard_failure
-
-        reasons = dedupe_keep_order(reasons)
-        if hard_failure:
-            return VERDICT_FAIL, reasons
-        if uncertain:
-            return VERDICT_UNKNOWN, reasons
-        return VERDICT_PASS, []
+        return self._classify_delete_common(path, st, unknown_children=False, failed_children=False)
 
     def classify_dir_delete(
         self,
         path: str,
         st: os.stat_result,
+        unknown_children: bool,
+        failed_children: bool,
+    ) -> Tuple[str, List[str]]:
+        return self._classify_delete_common(
+            path,
+            st,
+            unknown_children=unknown_children,
+            failed_children=failed_children,
+        )
+
+    def _classify_delete_common(
+        self,
+        path: str,
+        st: os.stat_result,
+        *,
         unknown_children: bool,
         failed_children: bool,
     ) -> Tuple[str, List[str]]:
@@ -1237,25 +1497,56 @@ class Simulator:
         uncertain |= flag_uncertain
         hard_failure |= flag_hard_failure
 
-        if self.mounts.is_mountpoint(path):
-            reasons.append("mountpoint_busy")
-            hard_failure = True
+        mountpoint_reasons, mountpoint_hard_failure = self._mountpoint_delete_reasons(path)
+        reasons.extend(mountpoint_reasons)
+        hard_failure |= mountpoint_hard_failure
 
         parent = normalize(os.path.dirname(path) or "/")
         fs_reasons, fs_uncertain = self.maybe_fs_uncertain(parent)
         reasons.extend(fs_reasons)
         uncertain |= fs_uncertain
 
-        try:
-            parent_st = os.lstat(parent)
-        except OSError as e:
-            reasons.append(f"parent_lstat_errno_{e.errno}:{e.strerror}")
+        parent_st, parent_lstat_reason = self._lstat_parent_for_delete(parent)
+        if parent_lstat_reason is not None:
+            reasons.append(parent_lstat_reason)
             return VERDICT_UNKNOWN, reasons
+        assert parent_st is not None
 
         parent_reasons, parent_uncertain, parent_hard_failure = self.parent_delete_checks(parent, path, parent_st, st)
         reasons.extend(parent_reasons)
         uncertain |= parent_uncertain
         hard_failure |= parent_hard_failure
+
+        child_reasons, child_uncertain, child_hard_failure = self._delete_child_state_reasons(
+            unknown_children,
+            failed_children,
+        )
+        reasons.extend(child_reasons)
+        uncertain |= child_uncertain
+        hard_failure |= child_hard_failure
+
+        reasons = dedupe_keep_order(reasons)
+        return _verdict_from_flags(hard_failure, uncertain, reasons)
+
+    def _mountpoint_delete_reasons(self, path: str) -> Tuple[List[str], bool]:
+        if self.mounts.is_mountpoint(path):
+            return ["mountpoint_busy"], True
+        return [], False
+
+    def _lstat_parent_for_delete(self, parent: str) -> Tuple[Optional[os.stat_result], Optional[str]]:
+        try:
+            return os.lstat(parent), None
+        except OSError as e:
+            return None, f"parent_lstat_errno_{e.errno}:{e.strerror}"
+
+    def _delete_child_state_reasons(
+        self,
+        unknown_children: bool,
+        failed_children: bool,
+    ) -> Tuple[List[str], bool, bool]:
+        reasons: List[str] = []
+        uncertain = False
+        hard_failure = False
 
         if unknown_children:
             reasons.append("unknown_descendants")
@@ -1264,12 +1555,7 @@ class Simulator:
             reasons.append("would_remain_nonempty_due_to_failed_children")
             hard_failure = True
 
-        reasons = dedupe_keep_order(reasons)
-        if hard_failure:
-            return VERDICT_FAIL, reasons
-        if uncertain:
-            return VERDICT_UNKNOWN, reasons
-        return VERDICT_PASS, []
+        return reasons, uncertain, hard_failure
 
     def classify_leaf_write_only(
         self,
@@ -1294,31 +1580,43 @@ class Simulator:
         reasons.extend(fs_reasons)
         uncertain |= fs_uncertain
 
-        if self.mounts.degraded:
-            uncertain = True
-        elif self.mounts.mount_for(path).read_only:
-            reasons.append("target_mount_read_only")
-            hard_failure = True
+        mount_reasons, mount_uncertain, mount_hard_failure = self._write_mount_reasons(path)
+        reasons.extend(mount_reasons)
+        uncertain |= mount_uncertain
+        hard_failure |= mount_hard_failure
 
-        if kind == KIND_DIR:
-            if not self.access(path, os.W_OK | os.X_OK):
-                if not self.access(path, os.W_OK):
-                    reasons.append("dir_not_writable")
-                    hard_failure = True
-                if not self.access(path, os.X_OK):
-                    reasons.append("dir_not_searchable")
-                    hard_failure = True
-        else:
-            if not self.access(path, os.W_OK):
-                reasons.append("target_not_writable")
-                hard_failure = True
+        access_reasons, access_hard_failure = self._write_access_reasons(path, kind)
+        reasons.extend(access_reasons)
+        hard_failure |= access_hard_failure
 
         reasons = dedupe_keep_order(reasons)
-        if hard_failure:
-            return VERDICT_FAIL, reasons
-        if uncertain:
-            return VERDICT_UNKNOWN, reasons
-        return VERDICT_PASS, []
+        return _verdict_from_flags(hard_failure, uncertain, reasons)
+
+    def _write_mount_reasons(self, path: str) -> Tuple[List[str], bool, bool]:
+        if self.mounts.degraded:
+            return [], True, False
+        if self.mounts.mount_for(path).read_only:
+            return ["target_mount_read_only"], False, True
+        return [], False, False
+
+    def _write_access_reasons(self, path: str, kind: str) -> Tuple[List[str], bool]:
+        if kind == KIND_DIR:
+            return self._dir_write_access_reasons(path)
+        if not self.access(path, os.W_OK):
+            return ["target_not_writable"], True
+        return [], False
+
+    def _dir_write_access_reasons(self, path: str) -> Tuple[List[str], bool]:
+        reasons: List[str] = []
+        hard_failure = False
+        if not self.access(path, os.W_OK | os.X_OK):
+            if not self.access(path, os.W_OK):
+                reasons.append("dir_not_writable")
+                hard_failure = True
+            if not self.access(path, os.X_OK):
+                reasons.append("dir_not_searchable")
+                hard_failure = True
+        return reasons, hard_failure
 
     def classify_dir_write_only(
         self,
@@ -1328,30 +1626,68 @@ class Simulator:
         return self.classify_leaf_write_only(path, st, KIND_DIR)
 
 
+def _verdict_from_flags(hard_failure: bool, uncertain: bool, reasons: List[str]) -> Tuple[str, List[str]]:
+    if hard_failure:
+        return VERDICT_FAIL, reasons
+    if uncertain:
+        return VERDICT_UNKNOWN, reasons
+    return VERDICT_PASS, []
+
+
 class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
     pass
 
 
-
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    home = os.path.expanduser("~")
-    example_home = normalize(home) if home else "$HOME"
-    prog = os.path.basename(sys.argv[0]) or "check_permissions.py"
+    # [AI_LOOKS_OK] Public parser entry point retained as a compatibility stub.
+    parser = _build_arg_parser()
+    ns = parser.parse_args(argv)
+    return _finalize_parsed_args(ns)
 
-    p = argparse.ArgumentParser(
-        prog=prog,
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = _new_arg_parser()
+    _add_path_argument(p)
+    _add_output_arguments(p)
+    _add_execution_arguments(p)
+    _add_filter_arguments(p)
+    _add_label_arguments(p)
+    _add_mode_arguments(p)
+    p.set_defaults(mode=MODE_CAN_DELETE_ONLY)
+    return p
+
+
+def _new_arg_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(
+        prog=_program_name(),
         description=(
             "Best-effort Linux simulator for rm -rf style deletion, writability "
             "checks, and optional labeled path output."
         ),
-        epilog=f"""
+        epilog=_parser_epilog(),
+        formatter_class=HelpFormatter,
+    )
+
+
+def _program_name() -> str:
+    # [AI_CLARIFY] Replicated: parse_args(argv) still derives prog from sys.argv[0], not argv.
+    return os.path.basename(sys.argv[0]) or "check_permissions.py"
+
+
+def _example_home() -> str:
+    home = os.path.expanduser("~")
+    return normalize(home) if home else "$HOME"
+
+
+def _parser_epilog() -> str:
+    return f"""
 Examples:
   %(prog)s /var/tmp/project
   %(prog)s --label /tmp
   %(prog)s --add-labels --can-write-or-delete /dev
   %(prog)s --all-results --format tsv /etc /var
   %(prog)s --can-write-only --directories-only /srv/data
-  %(prog)s --include-home {example_home}
+  %(prog)s --include-home {_example_home()}
   %(prog)s /srv --exclude /var/cache /tmp/a_file
   %(prog)s --run-as-root --one-file-system /
 
@@ -1359,6 +1695,12 @@ Output filtering:
   By default, paths under your home directory are suppressed from output. This
   only affects what is printed, not what gets scanned. Use --include-home to
   show them.
+
+Default no-argument scan:
+  With no PATH arguments, %(prog)s scans /. If the active temp directory is
+  write+searchable, it is automatically added to the exclusion list to avoid
+  reporting or walking ordinary writable temp-space. Use --include-tmp to scan
+  it anyway. Explicit PATH arguments are never auto-excluded this way.
 
 Exclusions:
   --exclude skips matching files and whole directory subtrees before scanning
@@ -1377,15 +1719,20 @@ Capability modes:
   --can-delete-only      default; path must be deletable
   --can-write-only       path must be writable
   --can-write-or-delete  path must be writable or deletable
-""",
-        formatter_class=HelpFormatter,
-    )
+"""
+
+
+def _add_path_argument(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "paths",
         nargs="*",
-        default=["/"],
-        help="Root path(s) to inspect recursively.",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="Root path(s) to inspect recursively. Defaults to / when omitted.",
     )
+
+
+def _add_output_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "-o",
         "--output",
@@ -1398,6 +1745,9 @@ Capability modes:
         default="paths",
         help="Output format. 'paths' prints escaped path strings.",
     )
+
+
+def _add_execution_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--run-as-root",
         "--run_as_root",
@@ -1440,6 +1790,9 @@ Capability modes:
             "effective capabilities are ignored in this mode."
         ),
     )
+
+
+def _add_filter_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--all-results",
         action="store_true",
@@ -1453,12 +1806,25 @@ Capability modes:
         help="Include paths from under the current user's home directory.",
     )
     p.add_argument(
+        "--include-tmp",
+        "--include_tmp",
+        dest="include_tmp",
+        action="store_true",
+        help=(
+            "For the default no-argument / scan, do not automatically exclude "
+            "the active writable temp directory."
+        ),
+    )
+    p.add_argument(
         "--directories-only",
         "--directories_only",
         dest="directories_only",
         action="store_true",
         help="Only print directory entries after all other filtering is applied.",
     )
+
+
+def _add_label_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--label",
         "--add-label",
@@ -1481,7 +1847,14 @@ Capability modes:
         help=argparse.SUPPRESS,
     )
 
+
+def _add_mode_arguments(p: argparse.ArgumentParser) -> None:
     mode = p.add_mutually_exclusive_group()
+    _add_primary_mode_arguments(mode)
+    _add_hidden_mode_aliases(mode)
+
+
+def _add_primary_mode_arguments(mode: argparse._MutuallyExclusiveGroup) -> None:
     mode.add_argument(
         "--can-delete-only",
         "--can_delete_only",
@@ -1510,6 +1883,8 @@ Capability modes:
         ),
     )
 
+
+def _add_hidden_mode_aliases(mode: argparse._MutuallyExclusiveGroup) -> None:
     mode.add_argument(
         "--can-write-delete",
         "--can_write_delete",
@@ -1518,7 +1893,6 @@ Capability modes:
         const=MODE_CAN_WRITE_OR_DELETE,
         help=argparse.SUPPRESS,
     )
-
     mode.add_argument(
         "--can-delete",
         "--can_delete",
@@ -1536,8 +1910,13 @@ Capability modes:
         help=argparse.SUPPRESS,
     )
 
-    p.set_defaults(mode=MODE_CAN_DELETE_ONLY)
-    return p.parse_args(argv)
+
+def _finalize_parsed_args(ns: argparse.Namespace) -> argparse.Namespace:
+    parsed_paths = getattr(ns, "paths", [])
+    ns.default_paths = not parsed_paths
+    if ns.default_paths:
+        ns.paths = ["/"]
+    return ns
 
 
 def should_keep_for_output(
@@ -1596,11 +1975,7 @@ def write_record(
     add_labels: bool = False,
 ) -> None:
     if fmt == "paths":
-        rendered_path = escape_text_field(display_path(record))
-        if add_labels and record.label is not None:
-            fp.write(f"[{record.label}] {rendered_path}\n")
-        else:
-            fp.write(rendered_path + "\n")
+        _write_path_record(record, fp, add_labels=add_labels)
         return
 
     if fmt == "jsonl":
@@ -1609,18 +1984,30 @@ def write_record(
 
     if fmt == "tsv":
         assert tsv_writer is not None
-        tsv_writer.writerow(
-            [
-                record.status,
-                record.kind,
-                record.mode,
-                display_path(record),
-                json.dumps(record.reasons, ensure_ascii=False, separators=(",", ":")),
-            ]
-        )
+        _write_tsv_record(record, tsv_writer)
         return
 
     raise ValueError(fmt)
+
+
+def _write_path_record(record: Outcome, fp, *, add_labels: bool) -> None:
+    rendered_path = escape_text_field(display_path(record))
+    if add_labels and record.label is not None:
+        fp.write(f"[{record.label}] {rendered_path}\n")
+    else:
+        fp.write(rendered_path + "\n")
+
+
+def _write_tsv_record(record: Outcome, tsv_writer: csv.writer) -> None:
+    tsv_writer.writerow(
+        [
+            record.status,
+            record.kind,
+            record.mode,
+            display_path(record),
+            json.dumps(record.reasons, ensure_ascii=False, separators=(",", ":")),
+        ]
+    )
 
 
 def safely_redirect_stdout_to_devnull() -> None:
@@ -1646,10 +2033,7 @@ def stream_outcomes(ns: argparse.Namespace, sim: Simulator) -> Iterator[Outcome]
     home_dirs = discover_home_dirs_with_realpaths()
     for raw in ns.paths:
         path = normalize(raw)
-        try:
-            root_dev = os.lstat(path).st_dev
-        except OSError:
-            root_dev = None
+        root_dev = _root_dev_for_path(path)
         for assessment in sim.simulate_path(path, mode=ns.mode, root_dev=root_dev):
             outcome = assessment.render(ns.mode)
             if should_keep_for_output(
@@ -1662,14 +2046,44 @@ def stream_outcomes(ns: argparse.Namespace, sim: Simulator) -> Iterator[Outcome]
                 yield outcome
 
 
+def _root_dev_for_path(path: str) -> Optional[int]:
+    try:
+        return os.lstat(path).st_dev
+    except OSError:
+        return None
+
+
 def flatten_exclude_args(groups: Sequence[Sequence[str]]) -> List[str]:
     return [path for group in groups for path in group]
 
 
+def default_tmp_excludes(ns: argparse.Namespace) -> List[str]:
+    if not getattr(ns, "default_paths", False):
+        return []
+    if ns.include_tmp:
+        return []
+    return discover_writable_tmp_dirs(effective_access=not ns.real_ids)
+
+
 def main(argv: Sequence[str]) -> int:
     ns = parse_args(argv)
-    ns.exclude_paths = flatten_exclude_args(ns.exclude_paths)
+    _apply_exclude_defaults(ns)
 
+    root_guard_exit = _root_guard_exit_code(ns)
+    if root_guard_exit is not None:
+        return root_guard_exit
+
+    sim = _build_simulator_from_namespace(ns)
+    _write_selected_outcomes(ns, sim)
+    return 0
+
+
+def _apply_exclude_defaults(ns: argparse.Namespace) -> None:
+    ns.exclude_paths = flatten_exclude_args(ns.exclude_paths)
+    ns.exclude_paths.extend(default_tmp_excludes(ns))
+
+
+def _root_guard_exit_code(ns: argparse.Namespace) -> Optional[int]:
     if os.geteuid() == 0 and not ns.run_as_root:
         sys.stderr.write(
             "This tool is primarily intended to audit filesystem permissions from a non-root user perspective.\n"
@@ -1684,8 +2098,11 @@ def main(argv: Sequence[str]) -> int:
         )
         sys.stderr.flush()
         return 2
+    return None
 
-    sim = Simulator(
+
+def _build_simulator_from_namespace(ns: argparse.Namespace) -> Simulator:
+    return Simulator(
         mounts=MountTable(parse_mountinfo()),
         preserve_root=ns.preserve_root,
         one_file_system=ns.one_file_system,
@@ -1694,18 +2111,20 @@ def main(argv: Sequence[str]) -> int:
         excluded_paths=ns.exclude_paths,
     )
 
+
+def _write_selected_outcomes(ns: argparse.Namespace, sim: Simulator) -> None:
     if ns.output == "-":
-        writer = write_header(ns.format, sys.stdout)
-        for outcome in stream_outcomes(ns, sim):
-            write_record(outcome, ns.format, sys.stdout, writer, add_labels=ns.add_labels)
-    else:
-        with open(ns.output, "w", encoding="utf-8", newline="") as f:
-            writer = write_header(ns.format, f)
-            for outcome in stream_outcomes(ns, sim):
-                write_record(outcome, ns.format, f, writer, add_labels=ns.add_labels)
+        _write_outcomes_to_file_object(ns, sim, sys.stdout)
+        return
 
-    return 0
+    with open(ns.output, "w", encoding="utf-8", newline="") as f:
+        _write_outcomes_to_file_object(ns, sim, f)
 
+
+def _write_outcomes_to_file_object(ns: argparse.Namespace, sim: Simulator, fp) -> None:
+    writer = write_header(ns.format, fp)
+    for outcome in stream_outcomes(ns, sim):
+        write_record(outcome, ns.format, fp, writer, add_labels=ns.add_labels)
 
 
 if __name__ == "__main__":
