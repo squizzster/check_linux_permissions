@@ -1,59 +1,205 @@
 # check_permissions.py
 
-`check_permissions.py` finds filesystem paths that the current Linux process
-appears able to change.
+**Your Linux user is only a sandbox if the filesystem agrees.**
 
-Use it to answer questions such as:
+`check_permissions.py` is a Linux-only tool that shows where a process
+identity appears able to change the filesystem: what it can delete, append to,
+overwrite, or create.
 
-- Which configuration files could this account overwrite?
-- Which files could it append to without being able to replace existing data?
-- Which entries or directory trees could it delete?
-- Where could it create new files or directories?
-- Does a service account have more filesystem access than intended?
+That matters for ordinary service accounts. It matters even more for autonomous
+AI agents.
 
-The tool asks the kernel about the process that runs it. Run it as the user,
-service account, container identity, or restricted root context whose access you
-want to inspect.
+## Why this exists
 
-## Run it
+Linux systems accumulate permission mistakes.
 
-Requirements: Linux and Python 3.9 or newer. There are no third-party Python
-dependencies.
+Packages and system tools are commonly installed as `root`. Installation
+scripts are not perfect. Neither are deployment scripts, old `chmod` commands,
+shared groups, copied directories, or one-off fixes made during an incident. A
+single wrongly owned directory or writable parent can leave an ordinary account
+with far more reach than anyone intended.
 
-```bash
-./check_permissions.py
+Most of the time, nobody notices. The service keeps running, the file looks
+read-only, and the machine appears healthy. The mistake becomes important only
+when the account is compromised, a tool behaves unexpectedly, or a human makes
+the wrong change.
+
+AI agents make that problem harder to ignore. Agents are often most useful when
+they can use a shell, edit files, run tools, build software, and operate with
+broad freedom. A prompt injection, malicious dependency, faulty tool call, or
+ordinary model error can turn that freedom into destructive action.
+
+A practical containment model is:
+
+```text
+one purpose or workflow
+        ↓
+one dedicated Linux user
+        ↓
+one intentionally writable workspace
+        ↓
+the Linux kernel is expected to enforce the boundary
 ```
 
-With no path argument, the tool scans `/` recursively and reports paths where
-the current process has at least one modeled mutation capability. The default
-root scan excludes `/proc` and the active writable temporary directory, and it
-does not traverse discovered process-related home directories.
+In this model, the user account is the sandbox and the kernel is the
+enforcement layer.
 
-Provide one or more paths for a smaller, focused audit:
+The idea is not to make an agent uselessly constrained. It is to give the
+agent broad control inside its own account while keeping that account narrow at
+the operating-system boundary.
+
+This is a strong way to reduce blast radius—but only when the user really is
+contained. If that account can alter another service's configuration, replace a
+startup script, delete shared data, or create files in a privileged directory,
+then the supposed sandbox already has holes.
+
+**This tool audits that assumption.** Run it as the user, service account,
+container identity, or restricted root context you care about. It asks the
+kernel and examines filesystem evidence to find the paths that identity appears
+able to mutate.
+
+It does not prove that an agent can never escape its account by every possible
+route. It answers a narrower and extremely practical question:
+
+> If this process became malicious, compromised, or simply wrong right now,
+> which filesystem paths could it plausibly damage or change?
+
+## The kinds of mistakes it can expose
+
+For example, it can help find cases where:
+
+- an agent account can overwrite a system or application configuration file;
+- a service can delete another service's files because the parent directory is
+  writable;
+- a supposedly isolated workflow can create files inside another workflow's
+  tree;
+- an account can replace a read-only file by deleting its directory entry and
+  creating a new one;
+- a file can be appended to even though ordinary replacement or truncation is
+  blocked;
+- a package or deployment process left an unexpected group-writable path;
+- an old shared directory gives several unrelated service accounts mutual
+  destructive access.
+
+The goal is not to prove that a machine is perfectly secure. The goal is to
+make unintended filesystem reach visible before an incident relies on it.
+
+## A real-world first check
+
+Suppose an AI workflow runs as `invoice-agent` and should only change files
+inside `/srv/invoice-agent`.
+
+Run a focused audit as that identity against the places where cross-boundary
+access would matter:
+
+```bash
+sudo -u invoice-agent -- ./check_permissions.py \
+  /etc \
+  /usr/local \
+  /opt \
+  /srv \
+  /var/lib \
+  /var/spool \
+  /home
+```
+
+Expected results might include the agent's own workspace, cache, or log
+location. Results under another service's directory, a system configuration
+path, a shared executable directory, or another user's home should be treated
+as questions that need answers.
+
+No output for a path means the model did not find an allowed selected
+capability in the emitted results. It is useful evidence, but it is not proof
+that the account is harmless or that every possible mutation route was
+modeled.
+
+## Install and run
+
+Requirements:
+
+- Linux;
+- Python 3.9 or newer;
+- no third-party Python dependencies.
+
+Clone the repository and inspect the available options:
+
+```bash
+git clone https://github.com/squizzster/check_linux_permissions.git
+cd check_linux_permissions
+chmod +x check_permissions.py
+./check_permissions.py --help
+```
+
+You can also run it explicitly with Python:
+
+```bash
+python3 check_permissions.py --help
+```
+
+### Scan one or more paths
+
+Focused scans are usually faster and easier to interpret:
 
 ```bash
 ./check_permissions.py /path/to/check
 ./check_permissions.py /etc /opt/my-service /srv/data
 ```
 
-Run it as a service account to inspect that account's effective access:
+### Scan the system from `/`
+
+With no path argument, the tool scans `/` recursively:
+
+```bash
+./check_permissions.py
+```
+
+The default no-path scan excludes `/proc` and the first active writable
+temporary directory, and it does not traverse discovered process-related home
+directories. Explicitly provided roots are not automatically excluded.
+
+For containment reviews, explicitly naming sensitive roots is often clearer
+than relying only on the default scan.
+
+### Run it as the identity you actually want to inspect
+
+The result describes the process that runs the tool—not the user reading the
+report.
+
+Audit a service account:
 
 ```bash
 sudo -u www-data -- ./check_permissions.py /etc/my-service /srv/my-service
 ```
 
-An effective-root audit requires explicit confirmation because unrestricted
-root normally has access to almost everything:
+Audit a dedicated agent account:
+
+```bash
+sudo -u build-agent -- ./check_permissions.py \
+  /etc /usr/local /opt /srv /var/lib /home
+```
+
+The script itself must be readable or executable as appropriate, and every
+parent directory needed to reach it must be searchable by the audited
+identity. Placing a reviewed copy in
+a neutral, non-writable location can make repeated service-account audits
+easier.
+
+### Root audits are deliberately explicit
+
+Unrestricted root normally has access to almost everything, so an accidental
+root audit is usually noise. Effective-UID-0 execution is refused unless you
+confirm that root-context evidence is what you want:
 
 ```bash
 sudo ./check_permissions.py --allow-root-audit /path/to/check
 ```
 
-Use `./check_permissions.py --help` for every option.
+A root audit can still be meaningful for a restricted container, capability
+set, namespace, or other deliberately constrained root context.
 
 ## Reading the output
 
-Interactive terminal output is a list of paths with capability labels:
+Interactive terminal output is a compact list of paths with capability labels:
 
 ```text
 [dao] /srv/application/settings.ini
@@ -71,29 +217,120 @@ The labels mean:
 | `s` | Pass permission checks for writing a special file or device |
 
 Only paths with at least one allowed selected capability are printed by
-default. No output means the model did not find an allowed selected capability
-in the emitted results; it does not prove that the system is secure or that
-every possible mutation was modeled.
+default.
 
-## Why the checks are separate
+A directory has a trailing `/`. A symbolic link may be displayed as
+`link -> target`. Labels show only the selected capabilities that the model
+indicates are allowed.
 
-Linux does not have one universal "can write this path" permission.
+## What a good result looks like
 
-- Deleting a file is usually controlled by write and search permission on its
-  parent directory, plus sticky-directory and mount rules. The file's own write
-  bit does not decide whether its name can be removed.
-- Creating an entry requires write and search permission on the destination
+There is no universal clean output. It depends on the identity's purpose.
+
+For a tightly scoped agent or service account, a healthy result normally has a
+recognizable shape:
+
+- writable paths are concentrated in its own workspace, state, cache, log, or
+  spool directories;
+- other users' homes and other services' state trees do not appear;
+- system configuration and executable locations do not appear;
+- shared directories expose only the operations that were deliberately
+  granted;
+- every unexpected path has an understood and documented reason.
+
+Treat the output as a blast-radius map. The important question is not merely
+“can this account write something?” It is “can it change anything outside the
+boundary we intended?”
+
+## A practical containment workflow
+
+1. Give each agent, workflow, or service its own Linux identity where practical.
+2. Define the paths that identity is expected to change.
+3. Audit sensitive system paths, shared trees, other users' workspaces, and the
+   identity's intended workspace.
+4. Investigate every unexpected delete, append, overwrite, or create result.
+5. Correct ownership, group membership, directory modes, mount design, or
+   deployment behavior as appropriate, then run the same audit again.
+6. Repeat after package installations, deployment changes, account changes, or
+   any update that may alter filesystem ownership and permissions.
+
+This is especially useful as a deployment or image-build check: create the
+runtime identity, install the software, apply the intended permissions, and
+then audit the finished filesystem as that identity.
+
+## Useful focused checks
+
+### Could this account change configuration or installed software?
+
+```bash
+sudo -u my-agent -- ./check_permissions.py \
+  --capability overwrite_regular_file_content \
+  --capability append_regular_file_content \
+  /etc /usr/local /opt
+```
+
+### Could it delete or replace names in shared data trees?
+
+Deletion and creation are separate checks. Together they are particularly
+important because a file that is not writable may still be replaceable when its
+parent directory permits removing and recreating the name.
+
+```bash
+sudo -u my-agent -- ./check_permissions.py \
+  --capability delete_entry_or_tree \
+  --capability create_directory_entry \
+  /srv /var/lib /home
+```
+
+### Where can it create new files or directories?
+
+```bash
+sudo -u my-agent -- ./check_permissions.py \
+  --capability create_directory_entry \
+  /etc /usr/local /opt /srv /var/lib
+```
+
+### Which entries or trees can it delete?
+
+```bash
+sudo -u my-agent -- ./check_permissions.py \
+  --capability delete_entry_or_tree \
+  /srv/application
+```
+
+### Can it pass permission checks for special files?
+
+```bash
+./check_permissions.py \
+  --capability special_file_write_permission \
+  /dev
+```
+
+This special-file result does not exercise a device, FIFO, or socket and does
+not predict endpoint-specific behavior.
+
+## Why there is no single “writable” answer
+
+Linux does not have one universal “can write this path” permission.
+
+- **Deleting a file** is usually controlled by write and search permission on
+  its parent directory, plus sticky-directory, inode, and mount rules. The
+  file's own write bit does not decide whether its name can be removed.
+- **Creating an entry** requires write and search permission on the destination
   directory.
-- Appending and overwriting are different when an inode is append-only.
-- Read-only mounts and immutable or verity-protected inodes can block changes
-  that ordinary mode bits appear to allow.
-- Symlink deletion applies to the link entry. Content checks follow the link to
-  the regular-file target.
+- **Appending and overwriting** are different operations when an inode is
+  append-only.
+- **Read-only mounts and protected inodes** can block changes that ordinary mode
+  bits appear to allow.
+- **Symbolic links behave differently by operation.** Deletion applies to the
+  link entry; content checks follow the link to the target.
+- **Deleting a directory tree** requires the assessed descendants to be
+  removable too, not just the top-level directory name.
 
-Keeping these operations separate makes the result more useful than a simple
-search for world-writable files.
+Keeping these operations separate makes the result much more useful than a
+simple search for world-writable files.
 
-## Choose what to check
+## Choose exactly what to check
 
 The default capabilities are delete, append, overwrite, and create. Select a
 smaller set by repeating `--capability`:
@@ -105,40 +342,28 @@ smaller set by repeating `--capability`:
   /etc /opt
 ```
 
-Find deletable entries only:
+Available capability names are:
 
-```bash
-./check_permissions.py \
-  --capability delete_entry_or_tree \
-  /srv/application
+```text
+delete_entry_or_tree
+append_regular_file_content
+overwrite_regular_file_content
+create_directory_entry
+special_file_write_permission
 ```
 
-Check permission-layer access to special files explicitly:
-
-```bash
-./check_permissions.py \
-  --capability special_file_write_permission \
-  /dev
-```
-
-The special-file result does not exercise a device, FIFO, or socket and does
-not predict endpoint-specific behavior.
+Use `./check_permissions.py --help` for the full operation definitions and
+every command-line option.
 
 ## Control the scan
 
-With no path argument, the tool scans `/`. That default root scan excludes
-`/proc` and the first active writable temporary directory, and it does not
-traverse discovered process-related home directories. Explicitly provided
-roots are not automatically excluded.
-
-For faster, easier-to-interpret results, prefer explicit paths and optionally
-stay on each starting filesystem:
+Stay on each starting path's filesystem:
 
 ```bash
 ./check_permissions.py --stay-on-starting-filesystem /srv/application
 ```
 
-Exclude an exact path or directory subtree by repeating `--exclude`:
+Exclude an exact path or observed directory subtree by repeating `--exclude`:
 
 ```bash
 ./check_permissions.py \
@@ -147,22 +372,39 @@ Exclude an exact path or directory subtree by repeating `--exclude`:
   /srv/application
 ```
 
-The `--include-default-home-paths`,
-`--include-default-temporary-directory`, and
-`--include-default-proc-filesystem` options add those locations back to a
-default no-path scan.
+The following options add locations back to a default no-path scan:
 
-## JSON output
+```text
+--include-default-home-paths
+--include-default-temporary-directory
+--include-default-proc-filesystem
+```
+
+Explicitly provided scan roots are not automatically excluded.
+
+Mark an additional filesystem type as uncertain when its mutation semantics
+need conservative treatment beyond the built-in set:
+
+```bash
+./check_permissions.py \
+  --uncertain-filesystem-type myfs \
+  /mnt/myfs
+```
+
+Use `./check_permissions.py --version` to print the tool version.
+
+## JSON output and complete evidence
 
 When stdout is redirected or piped, output automatically becomes JSON Lines.
-Use `--json` to request it explicitly:
+Use `--json` (or its alias `--machine`) to request it explicitly:
 
 ```bash
 ./check_permissions.py --json /srv/application > permissions.jsonl
 ```
 
-Add `--include-nonmatching-records` when you also need blocked, uncertain, and
-skipped conclusions:
+By default, only records with at least one model-allowed selected capability
+are emitted. Add `--include-nonmatching-records` when you also need blocked,
+uncertain, and skipped conclusions:
 
 ```bash
 ./check_permissions.py \
@@ -171,16 +413,18 @@ skipped conclusions:
   /srv/application > complete-assessment.jsonl
 ```
 
-Each JSON path record includes its capability evidence and the run, process,
-mount-table, and source identity needed to interpret it independently.
+Each JSON path record includes capability evidence and the run, process,
+mount-table, scope, and source identity needed to interpret it independently.
+A provenance record is emitted even when no path record matches.
 
-Use `--human` to force compact path output through a pipe or into a file:
+Use `--human` (or its alias `--tty`) to force compact path output through a
+pipe or into a file:
 
 ```bash
 ./check_permissions.py --human /srv/application | less
 ```
 
-## Saving a report
+## Saving a report safely
 
 Shell redirection is the simplest way to save output. The tool also supports a
 guarded report destination:
@@ -189,12 +433,20 @@ guarded report destination:
 ./check_permissions.py --output permissions.jsonl /srv/application
 ```
 
-An existing destination is refused unless `--replace-output` is supplied.
+An existing destination is refused unless `--replace-output` is supplied:
+
+```bash
+./check_permissions.py \
+  --replace-output \
+  --output permissions.jsonl \
+  /srv/application
+```
+
 Replacement is limited to a regular file and uses a synchronized temporary
 sibling plus atomic rename checks. Symlink and special-file destinations are
 refused.
 
-Writing a report file is the tool's deliberate filesystem-mutation exception.
+Writing the report file is the tool's deliberate filesystem-mutation exception.
 Use stdout when even report creation is not acceptable.
 
 ## What the model examines
@@ -212,11 +464,33 @@ The audit combines:
 Unavailable or insufficient evidence is reported as uncertainty rather than
 silently treated as permission.
 
+## What this tool does not tell you
+
+This is a filesystem mutation audit, not a complete security audit or universal
+sandbox verifier.
+
+It does not inventory whether the process can:
+
+- read secrets or private files;
+- use the network or reach remote services;
+- signal, trace, inject into, or otherwise control another process;
+- use `sudo`, set-user-ID programs, privileged helpers, or another escalation
+  path;
+- misuse credentials already available in environment variables, files,
+  agents, sockets, or keyrings;
+- exploit the kernel, a driver, a service, or a device endpoint;
+- cause harm through an application protocol even when filesystem writes are
+  blocked.
+
+Those are separate boundaries and need separate controls. A dedicated Linux
+user is a valuable layer of defense, but it is not automatically equivalent to
+a container, virtual machine, or complete sandbox.
+
 ## Safety and limitations
 
 The tool does not test its conclusions by modifying audited paths. It does not
-intentionally open them for writing, create or remove entries, rename them,
-change ownership or permissions, or set inode flags.
+intentionally open audited targets for writing, create or remove entries,
+rename them, change ownership or permissions, or set inode flags.
 
 Scanning is still not forensically side-effect free. Directory reads request
 `O_NOATIME`, but a reported fallback read may update access time. Reads can also
@@ -224,10 +498,15 @@ trigger automounts, network or FUSE activity, and device- or
 filesystem-specific behavior. Use a snapshot or read-only mount when strict
 non-interference is required.
 
-Results are a best-effort model, not proof that a future syscall will succeed.
-Live filesystem races, ACL and idmapped-mount details, SELinux/AppArmor or other
-LSM policy, seccomp, leases, quotas, resource limits, remote filesystems, and
-special endpoint behavior can differ from the modeled result.
+Results are a best-effort model, not proof that a future system call will
+succeed. Live filesystem races, ACL and idmapped-mount details, SELinux/AppArmor
+or other LSM policy, seccomp, leases, quotas, resource limits, remote
+filesystems, and special endpoint behavior can differ from the modeled result.
+
+Run the tool from a trusted copy. An audit performed with a modified script or
+under a different identity does not describe the boundary you intended to
+check. Structured reports include source identity and digest evidence to help
+preserve that context.
 
 ## Tests
 
