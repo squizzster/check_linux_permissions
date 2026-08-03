@@ -226,8 +226,8 @@ set, namespace, or other deliberately constrained root context.
 Interactive terminal output is a compact list of paths with capability labels:
 
 ```text
-[dao] /srv/application/settings.ini
-[dc] /srv/application/cache/
+[dao] "/srv/application/settings.ini"
+[dc] "/srv/application/cache/"
 ```
 
 The labels mean:
@@ -243,9 +243,12 @@ The labels mean:
 Only paths with at least one allowed selected capability are printed by
 default.
 
-A directory has a trailing `/`. A symbolic link may be displayed as
-`link -> target`. Labels show only the selected capabilities that the model
-indicates are allowed.
+A directory has a trailing `/`. Paths are individually quoted; every
+non-ASCII or non-printable character is escaped so bidi text, combining marks,
+variation selectors, and invisible formatting cannot alter neighboring text.
+A symbolic link is displayed as
+`"link" -> "target"`, with each side escaped separately. Labels show only the
+selected capabilities that the model indicates are allowed.
 
 ## What a good result looks like
 
@@ -401,6 +404,10 @@ Exclude an exact path or observed directory subtree by repeating `--exclude`:
   /srv/application
 ```
 
+A trailing slash makes an observed directory exclusion recursive. If the final
+component is a symbolic link, the rule excludes that link entry exactly rather
+than following it into the target tree.
+
 The following options add locations back to a default no-path scan:
 
 ```text
@@ -415,6 +422,13 @@ Input paths retain kernel-significant `.` and `..` components and trailing
 slashes until Linux resolves them. For example, if an intermediate component
 is a symbolic link, `link/../target` is not rewritten lexically before the
 kernel sees it.
+
+A final symbolic link followed by a trailing slash remains identified as a
+symbolic link in the report. Target-following capabilities are modeled, but
+deletion of that requested spelling is blocked because `unlink`/`rmdir` cannot
+remove either the link entry or its target through the trailing slash. The
+target identity is captured during preflight and revalidated after assessment;
+a change makes every target-following inference materially uncertain.
 
 Mark an additional filesystem type as uncertain when its mutation semantics
 need conservative treatment beyond the built-in set:
@@ -463,7 +477,15 @@ remains available as the older explicit spelling for including the complete
 record set and its routine evidence.
 
 Each JSON path record includes capability evidence and the run, process,
-mount-table, scope, and source identity needed to interpret it independently.
+mount-table, scope, and code/source identity needed to interpret it independently.
+The loaded-module digest identifies the executing marshaled Python code object.
+The source-file digest is separately labeled as a later pathname snapshot, not
+as proof that those bytes are the code already loaded by the process.
+Every filesystem-path field also has a neighboring `*_bytes_base64` field (or
+list of fields) containing the reversible Linux filename bytes. Consumers that
+must identify exact objects should use that byte representation rather than
+assuming the JSON display string is valid UTF-8. Mountpoint evidence includes
+the same base64 representation.
 A provenance record is emitted even when no path record matches. A successful
 JSONL generation ends with an `audit_run_completion` record. Normal output adds
 material-uncertainty fields only when material uncertainty occurred; full-audit
@@ -502,6 +524,22 @@ refused. Non-sticky destination directories writable by group or other users
 are also refused because another user could swap a checked temporary entry
 before cleanup. Sticky shared directories remain supported; processes running
 under the same user identity remain within the publication trust boundary.
+The report destination cannot also be an exact scan root. Encountering a
+symbolic link whose resolved target is the destination or unpublished report
+also aborts publication, including when the target did not exist before the
+audit. Report artifacts inside a larger scanned tree are omitted from path
+records and do not alter descendant deletion aggregation.
+
+The destination parent must be openable for reading as a directory in addition
+to allowing write and search. The readable directory descriptor is required
+for directory `fsync`; write-and-search-only directories are reported as output
+failures. During replacement, the validated exchange is synchronized before
+the displaced file is removed, then the cleanup is synchronized again. If the
+new report is visible but final cleanup durability cannot be confirmed, the
+diagnostic explicitly reports partial publication.
+A first-time destination whose post-rename identity validation fails is moved
+back to its private temporary name before cleanup; failure to reverse that
+visibility is reported as partial publication.
 
 Writing the report file is the tool's deliberate filesystem-mutation exception.
 Use stdout when even report creation is not acceptable.
@@ -584,8 +622,8 @@ differ from the modeled result.
 
 Run the tool from a trusted copy. An audit performed with a modified script or
 under a different identity does not describe the boundary you intended to
-check. Structured reports include source identity and digest evidence to help
-preserve that context.
+check. Structured reports include both executing-code and observed-source
+identity evidence to help preserve that context.
 
 ## Tests
 
@@ -608,7 +646,9 @@ flags.
 | `3` | Report destination or output failed |
 | `4` | An unexpected audit runtime failure occurred |
 | `5` | Audit/report completed, but `--fail-on-uncertainty` found material uncertainty |
+| `6` | Standard-output transport ended before the complete audit was delivered |
 | `130` | The process was interrupted |
 
-Broken stdout pipes exit successfully so commands such as
-`./check_permissions.py /path | head` behave normally.
+A broken stdout pipe before the completion record exits with status `6`.
+Scripts can therefore distinguish a deliberately truncated pipeline from a
+completed audit without parsing a partial stream as success.

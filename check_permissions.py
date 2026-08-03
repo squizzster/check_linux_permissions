@@ -7,7 +7,8 @@ The standalone tool requires Linux and Python 3.9 or newer.
 This program observes Linux metadata and asks the kernel permission questions;
 it does not prove that a future mutation syscall will succeed.  Every structured
 record names the model version, observation time, process-credential evidence,
-mount-table evidence, source-code digest, and modeled conclusions.  Routine
+mount-table evidence, loaded-code and observed-source digests, and modeled
+conclusions.  Routine
 limitations are retained but omitted from normal output; ``--full-audit``
 includes routine and material uncertainty.  Live filesystem races, MAC/LSM
 policy, leases, idmapped mounts, remote filesystems, and device-specific
@@ -46,11 +47,13 @@ is not described as a general filesystem transaction.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import ctypes
 import errno
 import hashlib
 import json
+import marshal
 import os
 import stat
 import sys
@@ -60,7 +63,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
-from typing import TextIO, TypeVar, Union
+from typing import Optional, Protocol, TextIO, TypeVar, Union
 
 try:
     import pwd
@@ -68,10 +71,16 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
     pwd = None  # type: ignore[assignment]
 
 AUDIT_TOOL_NAME = "check_permissions.py"
-AUDIT_TOOL_VERSION = "4.0.0"
-CAPABILITY_MODEL_ID = "linux-filesystem-mutation-permission-model/v3"
-STRUCTURED_RECORD_SCHEMA_ID = "linux-filesystem-permission-audit-record/v3"
-AUDIT_RUN_PROVENANCE_SCHEMA_ID = "linux-filesystem-permission-audit-run-provenance/v3"
+AUDIT_TOOL_VERSION = "4.1.0"
+CAPABILITY_MODEL_ID = "linux-filesystem-mutation-permission-model/v4"
+STRUCTURED_RECORD_SCHEMA_ID = "linux-filesystem-permission-audit-record/v4"
+AUDIT_RUN_PROVENANCE_SCHEMA_ID = "linux-filesystem-permission-audit-run-provenance/v4"
+
+# This identifies the code object that Python actually loaded, independently
+# of any later replacement of the source pathname on disk.
+LOADED_MODULE_CODE_SHA256 = hashlib.sha256(
+    marshal.dumps(sys._getframe().f_code)
+).hexdigest()
 
 _OS_PATH_REALPATH_SUPPORTS_STRICT = sys.version_info >= (3, 10)
 STRICT_PATH_RESOLUTION_EVIDENCE_SOURCE = (
@@ -85,7 +94,12 @@ EXIT_COMMAND_LINE_REFUSED = 2
 EXIT_REPORT_OUTPUT_FAILED = 3
 EXIT_AUDIT_RUNTIME_FAILED = 4
 EXIT_AUDIT_EVIDENCE_UNCERTAIN = 5
+EXIT_AUDIT_REPORT_INCOMPLETE = 6
 EXIT_INTERRUPTED = 130
+
+
+class AuditScopeConflictError(Exception):
+    """An audited pathname aliases an internal report transport artifact."""
 
 CAPABILITY_DELETE_ENTRY_OR_TREE = "delete_entry_or_tree"
 CAPABILITY_APPEND_REGULAR_FILE_CONTENT = "append_regular_file_content"
@@ -244,10 +258,10 @@ class EvidenceReason:
     """One structured reason supporting or limiting a model inference."""
 
     reason_code: str
-    evidence_source: str | None = None
-    detail: str | None = None
-    operating_system_errno: int | None = None
-    operating_system_message: str | None = None
+    evidence_source: Optional[str] = None
+    detail: Optional[str] = None
+    operating_system_errno: Optional[int] = None
+    operating_system_message: Optional[str] = None
 
     def as_serializable_dictionary(self) -> dict[str, object]:
         serialized_reason: dict[str, object] = {"reason_code": self.reason_code}
@@ -764,10 +778,10 @@ def rename_linux_directory_entry_with_flags(
 class LinuxInodeAttributeEvidence:
     """Mutation-constraining inode attributes returned by Linux statx."""
 
-    immutable_attribute_is_set: bool | None
-    append_only_attribute_is_set: bool | None
-    verity_attribute_is_set: bool | None
-    verity_uncertainty_reason: EvidenceReason | None = None
+    immutable_attribute_is_set: Optional[bool]
+    append_only_attribute_is_set: Optional[bool]
+    verity_attribute_is_set: Optional[bool]
+    verity_uncertainty_reason: Optional[EvidenceReason] = None
     uncertainty_reasons: tuple[EvidenceReason, ...] = ()
     observed_at_utc: str = field(default_factory=current_utc_timestamp)
 
@@ -953,8 +967,8 @@ def observe_linux_inode_attributes(
 class EffectiveLinuxCapabilityMaskEvidence:
     """Effective capability bitmask read from the calling thread's status."""
 
-    capability_mask: int | None
-    uncertainty_reason: EvidenceReason | None
+    capability_mask: Optional[int]
+    uncertainty_reason: Optional[EvidenceReason]
     source_path: str = LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH
     observed_at_utc: str = field(default_factory=current_utc_timestamp)
 
@@ -1036,9 +1050,9 @@ def observe_effective_linux_capability_mask() -> EffectiveLinuxCapabilityMaskEvi
 class LinuxFilesystemIdentifierEvidence:
     """Filesystem UID/GID read from the calling thread's proc status."""
 
-    filesystem_user_id: int | None
-    filesystem_group_id: int | None
-    uncertainty_reason: EvidenceReason | None
+    filesystem_user_id: Optional[int]
+    filesystem_group_id: Optional[int]
+    uncertainty_reason: Optional[EvidenceReason]
     source_path: str = LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH
     observed_at_utc: str = field(default_factory=current_utc_timestamp)
 
@@ -1185,9 +1199,9 @@ def observe_linux_process_credentials() -> LinuxProcessCredentialEvidence:
 class KernelPathAccessEvidence:
     """Kernel response to one access-mode question."""
 
-    access_is_allowed: bool | None
-    uncertainty_reason: EvidenceReason | None
-    operating_system_errno: int | None = None
+    access_is_allowed: Optional[bool]
+    uncertainty_reason: Optional[EvidenceReason]
+    operating_system_errno: Optional[int] = None
     evidence_source: str = "faccessat2(2)"
 
 
@@ -1432,6 +1446,23 @@ def observe_canonical_path_for_file_descriptor(
         if not observed_path.startswith("/"):
             raise ValueError("descriptor link target is not absolute")
         if observed_path.endswith(" (deleted)"):
+            # procfs uses the same suffix both for an unlinked file and for a
+            # live filename that literally ends in " (deleted)".  A pathname
+            # lookup that still reaches the captured identity disambiguates
+            # the live-name case.
+            try:
+                observed_path_metadata = os.stat(
+                    observed_path,
+                    follow_symlinks=False,
+                )
+                descriptor_metadata = os.fstat(file_descriptor)
+            except OSError:
+                pass
+            else:
+                if FilesystemObjectIdentity.from_stat_result(
+                    observed_path_metadata
+                ) == FilesystemObjectIdentity.from_stat_result(descriptor_metadata):
+                    return lexically_normalize_absolute_path(observed_path), None
             return (
                 fallback_path,
                 EvidenceReason(
@@ -1501,11 +1532,11 @@ def observe_canonical_existing_directory(
 class StrictPathResolutionObservation:
     """Context-neutral result of one strict pathname resolution attempt."""
 
-    resolved_path: str | None
-    failure_kind: str | None = None
-    operating_system_errno: int | None = None
-    operating_system_message: str | None = None
-    runtime_error_detail: str | None = None
+    resolved_path: Optional[str]
+    failure_kind: Optional[str] = None
+    operating_system_errno: Optional[int] = None
+    operating_system_message: Optional[str] = None
+    runtime_error_detail: Optional[str] = None
 
 
 def observe_strict_path_resolution(
@@ -1654,7 +1685,7 @@ class PathExclusionRule:
     excluded_path: str
     includes_descendants: bool
     rule_origin: str
-    classification_uncertainty_reason: EvidenceReason | None = None
+    classification_uncertainty_reason: Optional[EvidenceReason] = None
 
 
 def path_exclusion_rule_from_user_argument(
@@ -1662,7 +1693,7 @@ def path_exclusion_rule_from_user_argument(
 ) -> PathExclusionRule:
     requested_path = split_requested_path_without_normalizing(unnormalized_path)
     normalized_path = requested_path.absolute_path_with_dot_components
-    includes_descendants = requested_path.trailing_separator_requires_directory
+    includes_descendants = False
     classification_uncertainty_reason: EvidenceReason | None = None
     parent_file_descriptor: int | None = None
     object_file_descriptor: int | None = None
@@ -1679,11 +1710,8 @@ def path_exclusion_rule_from_user_argument(
                 fallback_path=requested_path.parent_path_with_dot_components,
             )
         )
-        object_lookup_name = requested_path.final_component
-        if requested_path.trailing_separator_requires_directory:
-            object_lookup_name += "/"
         object_file_descriptor = os.open(
-            object_lookup_name,
+            requested_path.final_component,
             getattr(os, "O_PATH", 0o10000000)
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
@@ -1697,8 +1725,25 @@ def path_exclusion_rule_from_user_argument(
                 requested_path.final_component,
             ),
         )
-        includes_descendants |= stat.S_ISDIR(object_metadata.st_mode)
-        classification_uncertainty_reason = object_path_note or parent_path_note
+        # A trailing slash on a final symlink normally forces lookup through
+        # the link.  Exclusion matching instead follows the auditor's object
+        # identity rule: exclude the symlink entry itself, not an unrelated
+        # target tree reached through it.
+        includes_descendants = stat.S_ISDIR(object_metadata.st_mode)
+        if (
+            requested_path.trailing_separator_requires_directory
+            and not stat.S_ISDIR(object_metadata.st_mode)
+            and not stat.S_ISLNK(object_metadata.st_mode)
+        ):
+            classification_uncertainty_reason = EvidenceReason(
+                "trailing_separator_exclusion_target_is_not_a_directory",
+                evidence_source="fstat.st_mode",
+            )
+        classification_uncertainty_reason = (
+            classification_uncertainty_reason
+            or object_path_note
+            or parent_path_note
+        )
     except OSError as error:
         if parent_file_descriptor is not None:
             canonical_parent_path, _ = observe_canonical_path_for_file_descriptor(
@@ -1915,7 +1960,7 @@ def discover_process_related_home_directories(
 
 @dataclass(frozen=True)
 class TemporaryDirectoryDiscoveryEvidence:
-    selected_writable_temporary_directory: str | None
+    selected_writable_temporary_directory: Optional[str]
     normalized_candidate_paths: tuple[str, ...]
     candidate_observations: tuple[EvidenceReason, ...]
     uncertainty_reasons: tuple[EvidenceReason, ...]
@@ -2088,7 +2133,8 @@ def unescape_linux_mountinfo_field(escaped_mountinfo_field: str) -> str:
             and all(octal_digit in "01234567" for octal_digit in possible_octal_escape)
         )
         if escape_is_complete:
-            decoded_characters.append(chr(int(possible_octal_escape, 8)))
+            escaped_byte = int(possible_octal_escape, 8)
+            decoded_characters.append(os.fsdecode(bytes((escaped_byte,))))
             character_index += 4
             continue
         decoded_characters.append(escaped_mountinfo_field[character_index])
@@ -2117,6 +2163,8 @@ def linux_mount_record_evidence_summary(mount_record: LinuxMountRecord) -> str:
     return (
         f"mount_id={mount_record.mount_id}; "
         f"mount_point={json.dumps(mount_record.mount_point, ensure_ascii=True)}; "
+        "mount_point_bytes_base64="
+        f"{linux_path_bytes_base64(mount_record.mount_point)}; "
         f"filesystem_type={mount_record.filesystem_type}; "
         f"mount_options={','.join(mount_record.mount_options)}; "
         f"superblock_options={','.join(mount_record.superblock_options)}"
@@ -2128,7 +2176,7 @@ class LinuxMountTableReadEvidence:
     mount_records: tuple[LinuxMountRecord, ...]
     uncertainty_reasons: tuple[EvidenceReason, ...]
     source_path: str
-    source_sha256: str | None
+    source_sha256: Optional[str]
     observed_at_utc: str
 
     @property
@@ -2739,12 +2787,12 @@ class PathCapabilityAssessment:
     inference_by_capability_name: Mapping[str, CapabilityModelInference]
     assessment_completed_at_utc: str = field(default_factory=current_utc_timestamp)
     observation_notes: tuple[EvidenceReason, ...] = ()
-    audited_path_lstat_metadata: ObservedLinuxFilesystemObjectMetadata | None = None
-    resolved_symbolic_link_target_path: str | None = None
-    resolved_symbolic_link_target_kind: str | None = None
-    resolved_symbolic_link_target_stat_metadata: (
-        ObservedLinuxFilesystemObjectMetadata | None
-    ) = None
+    audited_path_lstat_metadata: Optional[ObservedLinuxFilesystemObjectMetadata] = None
+    resolved_symbolic_link_target_path: Optional[str] = None
+    resolved_symbolic_link_target_kind: Optional[str] = None
+    resolved_symbolic_link_target_stat_metadata: Optional[
+        ObservedLinuxFilesystemObjectMetadata
+    ] = None
 
     def inference_for_capability(
         self,
@@ -2848,12 +2896,12 @@ class StructuredPathAuditRecord:
     capability_evidence_reasons: tuple[EvidenceReason, ...]
     observation_notes: tuple[EvidenceReason, ...]
     assessment_completed_at_utc: str
-    audited_path_lstat_metadata: ObservedLinuxFilesystemObjectMetadata | None
-    resolved_symbolic_link_target_path: str | None = None
-    resolved_symbolic_link_target_kind: str | None = None
-    resolved_symbolic_link_target_stat_metadata: (
-        ObservedLinuxFilesystemObjectMetadata | None
-    ) = None
+    audited_path_lstat_metadata: Optional[ObservedLinuxFilesystemObjectMetadata]
+    resolved_symbolic_link_target_path: Optional[str] = None
+    resolved_symbolic_link_target_kind: Optional[str] = None
+    resolved_symbolic_link_target_stat_metadata: Optional[
+        ObservedLinuxFilesystemObjectMetadata
+    ] = None
 
     def as_serializable_dictionary(
         self,
@@ -3017,12 +3065,13 @@ class DirectoryPostorderAssessmentState:
     directory_entry_name: str
     entry_lookup_followed_symbolic_link: bool
     path_was_explicitly_requested: bool
-    directory_iterator: os.ScandirIterator | None
-    parent_directory_state: DirectoryPostorderAssessmentState | None
-    directory_listing_failure: EvidenceReason | None = None
+    directory_iterator: Union[DirectoryEntryIterator, None]
+    parent_directory_state: Union[DirectoryPostorderAssessmentState, None]
+    directory_listing_failure: Union[EvidenceReason, None] = None
     directory_observation_notes: list[EvidenceReason] = field(default_factory=list)
-    opened_directory_identity_matched_lstat: bool | None = None
+    opened_directory_identity_matched_lstat: Union[bool, None] = None
     has_child_with_uncertain_delete_inference: bool = False
+    highest_child_delete_uncertainty: Union[DescendantDeleteUncertainty, None] = None
     has_child_with_blocked_or_skipped_delete_inference: bool = False
 
 
@@ -3036,8 +3085,10 @@ class InspectPathTraversalInstruction:
     parent_directory_evidence_path: str
     directory_entry_name: str
     entry_lookup_followed_symbolic_link: bool
+    final_symbolic_link_has_trailing_separator: bool
+    trailing_separator_target_identity: Union[FilesystemObjectIdentity, None]
     path_was_explicitly_requested: bool
-    parent_directory_state: DirectoryPostorderAssessmentState | None
+    parent_directory_state: Optional[DirectoryPostorderAssessmentState]
     observation_notes: tuple[EvidenceReason, ...] = ()
 
 
@@ -3051,6 +3102,25 @@ class EmitDirectoryTraversalInstruction:
     directory_state: DirectoryPostorderAssessmentState
 
 
+class DirectoryEntryIterator(Protocol):
+    """Public structural type for the closeable iterator returned by scandir."""
+
+    def __iter__(self) -> Iterator[os.DirEntry[str]]: ...
+
+    def __next__(self) -> os.DirEntry[str]: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class DescendantDeleteUncertainty:
+    """Highest-grade direct-child uncertainty retained for parent evidence."""
+
+    uncertainty_grade: str
+    descendant_path: str
+    descendant_reason_code: str
+
+
 # ``type_a | type_b`` would be evaluated here despite postponed annotations;
 # typing.Union keeps this importable on the supported Python 3.9 floor.
 TraversalInstruction = Union[
@@ -3062,7 +3132,7 @@ TraversalInstruction = Union[
 
 @dataclass(frozen=True)
 class OpenDirectoryForListingEvidence:
-    directory_iterator: os.ScandirIterator
+    directory_iterator: DirectoryEntryIterator
     opened_directory_identity: FilesystemObjectIdentity
     noatime_was_used: bool
     observation_notes: tuple[EvidenceReason, ...]
@@ -3280,6 +3350,293 @@ class LinuxFilesystemMutationPermissionAuditor:
             ),
         )
 
+    def _capture_requested_path_root(
+        self,
+        requested_path: RequestedPathComponents,
+        selected_capabilities: Sequence[str],
+        *,
+        parent_open_flags: int,
+        object_open_flags: int,
+        owned_file_descriptors: set[int],
+    ) -> tuple[
+        InspectPathTraversalInstruction | None,
+        PathCapabilityAssessment | None,
+    ]:
+        """Capture one requested root or return its terminal failure assessment."""
+        try:
+            root_parent_file_descriptor = os.open(
+                requested_path.parent_path_with_dot_components,
+                parent_open_flags,
+            )
+            owned_file_descriptors.add(root_parent_file_descriptor)
+        except OSError as error:
+            return None, self._same_verdict_for_all_capabilities(
+                filesystem_object_kind=(
+                    FILESYSTEM_OBJECT_KIND_MISSING
+                    if error.errno == errno.ENOENT
+                    else FILESYSTEM_OBJECT_KIND_UNOBSERVED
+                ),
+                audited_path=requested_path.absolute_path_with_dot_components,
+                selected_capabilities=selected_capabilities,
+                model_verdict=(
+                    MODEL_VERDICT_INDICATES_BLOCKED
+                    if error.errno in {errno.ENOENT, errno.ENOTDIR}
+                    else MODEL_VERDICT_INSUFFICIENT_EVIDENCE
+                ),
+                evidence_reasons=(
+                    operating_system_error_reason(
+                        "cannot_open_requested_path_parent_directory",
+                        error,
+                        evidence_source="openat(O_PATH|O_DIRECTORY)",
+                    ),
+                ),
+            )
+
+        parent_display_path, parent_display_note = (
+            observe_canonical_path_for_file_descriptor(
+                root_parent_file_descriptor,
+                fallback_path=requested_path.parent_path_with_dot_components,
+            )
+        )
+        root_lookup_name = requested_path.final_component
+        final_symbolic_link_has_trailing_separator = False
+        trailing_separator_target_identity: Union[FilesystemObjectIdentity, None] = (
+            None
+        )
+        if requested_path.trailing_separator_requires_directory:
+            try:
+                final_entry_metadata = os.stat(
+                    requested_path.final_component,
+                    dir_fd=root_parent_file_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                # The capture below provides the errno-specific conclusion.
+                root_lookup_name += "/"
+            else:
+                if stat.S_ISLNK(final_entry_metadata.st_mode):
+                    try:
+                        followed_target_metadata = os.stat(
+                            requested_path.final_component,
+                            dir_fd=root_parent_file_descriptor,
+                            follow_symlinks=True,
+                        )
+                    except OSError as error:
+                        return None, self._same_verdict_for_all_capabilities(
+                            filesystem_object_kind=(
+                                FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK
+                            ),
+                            audited_path=(
+                                requested_path.absolute_path_with_dot_components
+                            ),
+                            selected_capabilities=selected_capabilities,
+                            model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
+                            evidence_reasons=(
+                                operating_system_error_reason(
+                                    "trailing_separator_target_cannot_be_resolved_as_directory",
+                                    error,
+                                    evidence_source="fstatat(2)",
+                                ),
+                            ),
+                            audited_path_lstat_metadata=(
+                                ObservedLinuxFilesystemObjectMetadata.from_stat_result(
+                                    final_entry_metadata
+                                )
+                            ),
+                        )
+                    if not stat.S_ISDIR(followed_target_metadata.st_mode):
+                        invalid_target_error = NotADirectoryError(
+                            errno.ENOTDIR,
+                            os.strerror(errno.ENOTDIR),
+                            requested_path.absolute_path_with_dot_components,
+                        )
+                        return None, self._same_verdict_for_all_capabilities(
+                            filesystem_object_kind=(
+                                FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK
+                            ),
+                            audited_path=(
+                                requested_path.absolute_path_with_dot_components
+                            ),
+                            selected_capabilities=selected_capabilities,
+                            model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
+                            evidence_reasons=(
+                                operating_system_error_reason(
+                                    "trailing_separator_target_is_not_a_directory",
+                                    invalid_target_error,
+                                    evidence_source="fstatat(2)",
+                                ),
+                            ),
+                            audited_path_lstat_metadata=(
+                                ObservedLinuxFilesystemObjectMetadata.from_stat_result(
+                                    final_entry_metadata
+                                )
+                            ),
+                        )
+                    # Preserve the link object. Target-following capabilities
+                    # are handled later without corrupting deletion semantics.
+                    final_symbolic_link_has_trailing_separator = True
+                    trailing_separator_target_identity = (
+                        FilesystemObjectIdentity.from_stat_result(
+                            followed_target_metadata
+                        )
+                    )
+                else:
+                    root_lookup_name += "/"
+
+        try:
+            root_object_file_descriptor = os.open(
+                root_lookup_name,
+                object_open_flags,
+                dir_fd=root_parent_file_descriptor,
+            )
+            owned_file_descriptors.add(root_object_file_descriptor)
+            root_metadata = os.fstat(root_object_file_descriptor)
+        except FileNotFoundError:
+            existing_final_entry_metadata: os.stat_result | None = None
+            if requested_path.trailing_separator_requires_directory:
+                with contextlib.suppress(OSError):
+                    existing_final_entry_metadata = os.stat(
+                        requested_path.final_component,
+                        dir_fd=root_parent_file_descriptor,
+                        follow_symlinks=False,
+                    )
+            if existing_final_entry_metadata is not None:
+                return None, self._same_verdict_for_all_capabilities(
+                    filesystem_object_kind=classify_filesystem_object_kind(
+                        existing_final_entry_metadata
+                    ),
+                    audited_path=requested_path.absolute_path_with_dot_components,
+                    selected_capabilities=selected_capabilities,
+                    model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
+                    evidence_reasons=(
+                        EvidenceReason(
+                            "trailing_separator_target_cannot_be_resolved_as_directory",
+                            evidence_source="openat(O_PATH|O_NOFOLLOW)",
+                            operating_system_errno=errno.ENOENT,
+                            operating_system_message=os.strerror(errno.ENOENT),
+                        ),
+                    ),
+                    audited_path_lstat_metadata=(
+                        ObservedLinuxFilesystemObjectMetadata.from_stat_result(
+                            existing_final_entry_metadata
+                        )
+                    ),
+                )
+            missing_display_path = (
+                parent_display_path
+                if requested_path.final_component == "."
+                else os.path.join(
+                    parent_display_path,
+                    requested_path.final_component,
+                )
+            )
+            missing_assessment = self.assess_explicitly_requested_missing_path(
+                missing_display_path,
+                selected_capabilities,
+                parent_directory_path=proc_path_for_file_descriptor(
+                    root_parent_file_descriptor
+                ),
+                parent_directory_metadata=os.fstat(root_parent_file_descriptor),
+                parent_directory_file_descriptor=root_parent_file_descriptor,
+            )
+            try:
+                os.stat(
+                    requested_path.final_component,
+                    dir_fd=root_parent_file_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                missing_assessment = self._assessment_with_identity_instability(
+                    missing_assessment,
+                    selected_capabilities,
+                    operating_system_error_reason(
+                        "cannot_revalidate_requested_missing_path",
+                        error,
+                        evidence_source="fstatat(2)",
+                    ),
+                )
+            else:
+                missing_assessment = self._assessment_with_identity_instability(
+                    missing_assessment,
+                    selected_capabilities,
+                    EvidenceReason(
+                        "requested_missing_path_appeared_during_assessment",
+                        evidence_source="fstatat(2)",
+                    ),
+                )
+            return None, missing_assessment
+        except NotADirectoryError as error:
+            return None, self._same_verdict_for_all_capabilities(
+                filesystem_object_kind=FILESYSTEM_OBJECT_KIND_UNOBSERVED,
+                audited_path=requested_path.absolute_path_with_dot_components,
+                selected_capabilities=selected_capabilities,
+                model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
+                evidence_reasons=(
+                    operating_system_error_reason(
+                        "requested_path_component_is_not_a_directory",
+                        error,
+                        evidence_source="openat(O_PATH)",
+                    ),
+                ),
+            )
+        except OSError as error:
+            return None, self._same_verdict_for_all_capabilities(
+                filesystem_object_kind=FILESYSTEM_OBJECT_KIND_UNOBSERVED,
+                audited_path=requested_path.absolute_path_with_dot_components,
+                selected_capabilities=selected_capabilities,
+                model_verdict=MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                evidence_reasons=(
+                    operating_system_error_reason(
+                        "cannot_capture_requested_path",
+                        error,
+                        evidence_source="openat(O_PATH|O_NOFOLLOW)",
+                    ),
+                ),
+            )
+
+        root_display_path, root_display_note = (
+            observe_canonical_path_for_file_descriptor(
+                root_object_file_descriptor,
+                fallback_path=requested_path.absolute_path_with_dot_components,
+            )
+        )
+        root_observation_notes = tuple(
+            reason
+            for reason in (parent_display_note, root_display_note)
+            if reason is not None
+        )
+        return (
+            InspectPathTraversalInstruction(
+                audited_path=root_display_path,
+                evidence_path=proc_path_for_file_descriptor(
+                    root_object_file_descriptor
+                ),
+                filesystem_metadata=root_metadata,
+                object_file_descriptor=root_object_file_descriptor,
+                parent_directory_file_descriptor=root_parent_file_descriptor,
+                parent_directory_evidence_path=proc_path_for_file_descriptor(
+                    root_parent_file_descriptor
+                ),
+                directory_entry_name=requested_path.final_component,
+                entry_lookup_followed_symbolic_link=(
+                    requested_path.trailing_separator_requires_directory
+                    and not final_symbolic_link_has_trailing_separator
+                ),
+                final_symbolic_link_has_trailing_separator=(
+                    final_symbolic_link_has_trailing_separator
+                ),
+                trailing_separator_target_identity=(
+                    trailing_separator_target_identity
+                ),
+                path_was_explicitly_requested=True,
+                parent_directory_state=None,
+                observation_notes=root_observation_notes,
+            ),
+            None,
+        )
+
     def assess_path_tree(
         self,
         path: str,
@@ -3292,7 +3649,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         pending_instructions: list[TraversalInstruction] = []
         active_directory_identities: set[FilesystemObjectIdentity] = set()
         owned_file_descriptors: set[int] = set()
-        open_directory_iterators: list[os.ScandirIterator] = []
+        open_directory_iterators: list[DirectoryEntryIterator] = []
 
         parent_open_flags = getattr(os, "O_PATH", 0o10000000)
         parent_open_flags |= getattr(os, "O_CLOEXEC", 0)
@@ -3302,198 +3659,23 @@ class LinuxFilesystemMutationPermissionAuditor:
         object_open_flags |= getattr(os, "O_NOFOLLOW", 0)
 
         try:
-            try:
-                root_parent_file_descriptor = os.open(
-                    requested_path.parent_path_with_dot_components,
-                    parent_open_flags,
-                )
-                owned_file_descriptors.add(root_parent_file_descriptor)
-            except OSError as error:
-                unavailable_assessment = self._same_verdict_for_all_capabilities(
-                    filesystem_object_kind=(
-                        FILESYSTEM_OBJECT_KIND_MISSING
-                        if error.errno == errno.ENOENT
-                        else FILESYSTEM_OBJECT_KIND_UNOBSERVED
-                    ),
-                    audited_path=requested_path.absolute_path_with_dot_components,
-                    selected_capabilities=normalized_selected_capabilities,
-                    model_verdict=(
-                        MODEL_VERDICT_INDICATES_BLOCKED
-                        if error.errno in {errno.ENOENT, errno.ENOTDIR}
-                        else MODEL_VERDICT_INSUFFICIENT_EVIDENCE
-                    ),
-                    evidence_reasons=(
-                        operating_system_error_reason(
-                            "cannot_open_requested_path_parent_directory",
-                            error,
-                            evidence_source="openat(O_PATH|O_DIRECTORY)",
-                        ),
-                    ),
-                )
-                yield unavailable_assessment
-                return
-
-            parent_display_path, parent_display_note = (
-                observe_canonical_path_for_file_descriptor(
-                    root_parent_file_descriptor,
-                    fallback_path=requested_path.parent_path_with_dot_components,
-                )
-            )
-            root_lookup_name = requested_path.final_component
-            if requested_path.trailing_separator_requires_directory:
-                root_lookup_name += "/"
-            try:
-                root_object_file_descriptor = os.open(
-                    root_lookup_name,
-                    object_open_flags,
-                    dir_fd=root_parent_file_descriptor,
-                )
-                owned_file_descriptors.add(root_object_file_descriptor)
-                root_metadata = os.fstat(root_object_file_descriptor)
-            except FileNotFoundError:
-                existing_final_entry_metadata: os.stat_result | None = None
-                if requested_path.trailing_separator_requires_directory:
-                    with contextlib.suppress(OSError):
-                        existing_final_entry_metadata = os.stat(
-                            requested_path.final_component,
-                            dir_fd=root_parent_file_descriptor,
-                            follow_symlinks=False,
-                        )
-                if existing_final_entry_metadata is not None:
-                    unresolved_target_assessment = self._same_verdict_for_all_capabilities(
-                        filesystem_object_kind=classify_filesystem_object_kind(
-                            existing_final_entry_metadata
-                        ),
-                        audited_path=(requested_path.absolute_path_with_dot_components),
-                        selected_capabilities=normalized_selected_capabilities,
-                        model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
-                        evidence_reasons=(
-                            EvidenceReason(
-                                "trailing_separator_target_cannot_be_resolved_as_directory",
-                                evidence_source="openat(O_PATH|O_NOFOLLOW)",
-                                operating_system_errno=errno.ENOENT,
-                                operating_system_message=os.strerror(errno.ENOENT),
-                            ),
-                        ),
-                        audited_path_lstat_metadata=(
-                            ObservedLinuxFilesystemObjectMetadata.from_stat_result(
-                                existing_final_entry_metadata
-                            )
-                        ),
-                    )
-                    yield unresolved_target_assessment
-                    return
-                missing_display_path = (
-                    parent_display_path
-                    if requested_path.final_component == "."
-                    else os.path.join(
-                        parent_display_path,
-                        requested_path.final_component,
-                    )
-                )
-                missing_assessment = self.assess_explicitly_requested_missing_path(
-                    missing_display_path,
+            root_instruction, terminal_root_assessment = (
+                self._capture_requested_path_root(
+                    requested_path,
                     normalized_selected_capabilities,
-                    parent_directory_path=proc_path_for_file_descriptor(
-                        root_parent_file_descriptor
-                    ),
-                    parent_directory_metadata=os.fstat(root_parent_file_descriptor),
-                    parent_directory_file_descriptor=root_parent_file_descriptor,
-                )
-                try:
-                    os.stat(
-                        requested_path.final_component,
-                        dir_fd=root_parent_file_descriptor,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    pass
-                except OSError as error:
-                    missing_assessment = self._assessment_with_identity_instability(
-                        missing_assessment,
-                        normalized_selected_capabilities,
-                        operating_system_error_reason(
-                            "cannot_revalidate_requested_missing_path",
-                            error,
-                            evidence_source="fstatat(2)",
-                        ),
-                    )
-                else:
-                    missing_assessment = self._assessment_with_identity_instability(
-                        missing_assessment,
-                        normalized_selected_capabilities,
-                        EvidenceReason(
-                            "requested_missing_path_appeared_during_assessment",
-                            evidence_source="fstatat(2)",
-                        ),
-                    )
-                yield missing_assessment
-                return
-            except NotADirectoryError as error:
-                invalid_assessment = self._same_verdict_for_all_capabilities(
-                    filesystem_object_kind=FILESYSTEM_OBJECT_KIND_UNOBSERVED,
-                    audited_path=requested_path.absolute_path_with_dot_components,
-                    selected_capabilities=normalized_selected_capabilities,
-                    model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
-                    evidence_reasons=(
-                        operating_system_error_reason(
-                            "requested_path_component_is_not_a_directory",
-                            error,
-                            evidence_source="openat(O_PATH)",
-                        ),
-                    ),
-                )
-                yield invalid_assessment
-                return
-            except OSError as error:
-                unavailable_assessment = self._same_verdict_for_all_capabilities(
-                    filesystem_object_kind=FILESYSTEM_OBJECT_KIND_UNOBSERVED,
-                    audited_path=requested_path.absolute_path_with_dot_components,
-                    selected_capabilities=normalized_selected_capabilities,
-                    model_verdict=MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
-                    evidence_reasons=(
-                        operating_system_error_reason(
-                            "cannot_capture_requested_path",
-                            error,
-                            evidence_source="openat(O_PATH|O_NOFOLLOW)",
-                        ),
-                    ),
-                )
-                yield unavailable_assessment
-                return
-
-            root_display_path, root_display_note = (
-                observe_canonical_path_for_file_descriptor(
-                    root_object_file_descriptor,
-                    fallback_path=requested_path.absolute_path_with_dot_components,
+                    parent_open_flags=parent_open_flags,
+                    object_open_flags=object_open_flags,
+                    owned_file_descriptors=owned_file_descriptors,
                 )
             )
-            root_observation_notes = tuple(
-                reason
-                for reason in (parent_display_note, root_display_note)
-                if reason is not None
-            )
-            pending_instructions.append(
-                InspectPathTraversalInstruction(
-                    audited_path=root_display_path,
-                    evidence_path=proc_path_for_file_descriptor(
-                        root_object_file_descriptor
-                    ),
-                    filesystem_metadata=root_metadata,
-                    object_file_descriptor=root_object_file_descriptor,
-                    parent_directory_file_descriptor=root_parent_file_descriptor,
-                    parent_directory_evidence_path=proc_path_for_file_descriptor(
-                        root_parent_file_descriptor
-                    ),
-                    directory_entry_name=requested_path.final_component,
-                    entry_lookup_followed_symbolic_link=(
-                        requested_path.trailing_separator_requires_directory
-                    ),
-                    path_was_explicitly_requested=True,
-                    parent_directory_state=None,
-                    observation_notes=root_observation_notes,
+            if terminal_root_assessment is not None:
+                yield terminal_root_assessment
+                return
+            if root_instruction is None:
+                raise RuntimeError(
+                    "requested path capture produced neither an instruction nor an assessment"
                 )
-            )
+            pending_instructions.append(root_instruction)
 
             while pending_instructions:
                 current_instruction = pending_instructions.pop()
@@ -3525,6 +3707,9 @@ class LinuxFilesystemMutationPermissionAuditor:
                         evidence_cache=evidence_cache,
                         has_uncertain_descendant_delete=(
                             directory_state.has_child_with_uncertain_delete_inference
+                        ),
+                        descendant_delete_uncertainty=(
+                            directory_state.highest_child_delete_uncertainty
                         ),
                         has_blocked_descendant_delete=(
                             directory_state.has_child_with_blocked_or_skipped_delete_inference
@@ -3719,6 +3904,8 @@ class LinuxFilesystemMutationPermissionAuditor:
                             ),
                             directory_entry_name=directory_entry.name,
                             entry_lookup_followed_symbolic_link=False,
+                            final_symbolic_link_has_trailing_separator=False,
+                            trailing_separator_target_identity=None,
                             path_was_explicitly_requested=False,
                             parent_directory_state=directory_state,
                             observation_notes=(
@@ -3736,24 +3923,9 @@ class LinuxFilesystemMutationPermissionAuditor:
                     current_metadata
                 )
                 if current_path in self.internally_ignored_paths:
-                    ignored_report_artifact_assessment = (
-                        self._same_verdict_for_all_capabilities(
-                            filesystem_object_kind=FILESYSTEM_OBJECT_KIND_UNOBSERVED,
-                            audited_path=current_path,
-                            selected_capabilities=(normalized_selected_capabilities),
-                            model_verdict=MODEL_VERDICT_SKIPPED,
-                            evidence_reasons=(
-                                EvidenceReason(
-                                    "path_is_an_active_audit_report_artifact",
-                                    evidence_source="report publication scope",
-                                ),
-                            ),
-                        )
-                    )
-                    self._record_direct_child_delete_inference(
-                        current_instruction.parent_directory_state,
-                        ignored_report_artifact_assessment,
-                    )
+                    # This entry was created or selected as part of report
+                    # transport, not the pre-publication tree being modeled.
+                    # It is intentionally neutral in descendant aggregation.
                     self._close_owned_file_descriptor(
                         current_instruction.object_file_descriptor,
                         owned_file_descriptors,
@@ -3819,63 +3991,13 @@ class LinuxFilesystemMutationPermissionAuditor:
                     continue
 
                 if filesystem_object_kind != FILESYSTEM_OBJECT_KIND_DIRECTORY:
-                    evidence_cache = self._captured_object_evidence_cache(
-                        evidence_path=current_instruction.evidence_path,
-                        object_file_descriptor=(
-                            current_instruction.object_file_descriptor
-                        ),
-                        parent_directory_evidence_path=(
-                            current_instruction.parent_directory_evidence_path
-                        ),
-                        parent_directory_file_descriptor=(
-                            current_instruction.parent_directory_file_descriptor
-                        ),
-                    )
-                    leaf_assessment = self.assess_non_directory_path(
-                        current_instruction.evidence_path,
+                    leaf_assessment = self._assess_captured_leaf_instruction(
+                        current_instruction,
                         current_metadata,
                         filesystem_object_kind,
                         normalized_selected_capabilities,
-                        audited_path=current_path,
-                        parent_directory_path=(
-                            current_instruction.parent_directory_evidence_path
-                        ),
-                        parent_directory_file_descriptor=(
-                            current_instruction.parent_directory_file_descriptor
-                        ),
-                        directory_entry_name=(current_instruction.directory_entry_name),
-                        evidence_cache=evidence_cache,
-                    )
-                    if current_instruction.observation_notes:
-                        leaf_assessment = self._assessment_with_observation_notes(
-                            leaf_assessment,
-                            current_instruction.observation_notes,
-                        )
-                    if (
-                        current_instruction.path_was_explicitly_requested
-                        and current_instruction.directory_entry_name in {".", ".."}
-                    ):
-                        leaf_assessment = (
-                            self._assessment_with_unremovable_dot_component(
-                                leaf_assessment
-                            )
-                        )
-                    identity_instability = self._entry_identity_instability_reason(
-                        parent_directory_file_descriptor=(
-                            current_instruction.parent_directory_file_descriptor
-                        ),
-                        directory_entry_name=(current_instruction.directory_entry_name),
                         expected_identity=current_identity,
-                        follow_symbolic_link=(
-                            current_instruction.entry_lookup_followed_symbolic_link
-                        ),
                     )
-                    if identity_instability is not None:
-                        leaf_assessment = self._assessment_with_identity_instability(
-                            leaf_assessment,
-                            normalized_selected_capabilities,
-                            identity_instability,
-                        )
                     self._record_direct_child_delete_inference(
                         current_instruction.parent_directory_state,
                         leaf_assessment,
@@ -4010,6 +4132,201 @@ class LinuxFilesystemMutationPermissionAuditor:
                     os.close(file_descriptor)
             active_directory_identities.clear()
 
+    def _assess_captured_leaf_instruction(
+        self,
+        instruction: InspectPathTraversalInstruction,
+        metadata: os.stat_result,
+        filesystem_object_kind: str,
+        selected_capabilities: Sequence[str],
+        *,
+        expected_identity: FilesystemObjectIdentity,
+    ) -> PathCapabilityAssessment:
+        """Assess and revalidate one captured non-directory traversal entry."""
+        if (
+            filesystem_object_kind == FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK
+            and self.internally_ignored_paths
+        ):
+            resolved_target_path, _ = self._observe_symbolic_link_target_path(
+                instruction.audited_path,
+                symbolic_link_file_descriptor=instruction.object_file_descriptor,
+            )
+            if (
+                resolved_target_path is not None
+                and lexically_normalize_absolute_path(resolved_target_path)
+                in self.internally_ignored_paths
+            ):
+                raise AuditScopeConflictError(
+                    "symbolic link in audit scope resolves to an internal report "
+                    "path: "
+                    f"link={instruction.audited_path!r}; "
+                    f"target={resolved_target_path!r}"
+                )
+        evidence_cache = self._captured_object_evidence_cache(
+            evidence_path=instruction.evidence_path,
+            object_file_descriptor=instruction.object_file_descriptor,
+            parent_directory_evidence_path=instruction.parent_directory_evidence_path,
+            parent_directory_file_descriptor=(
+                instruction.parent_directory_file_descriptor
+            ),
+        )
+        assessment = self.assess_non_directory_path(
+            instruction.evidence_path,
+            metadata,
+            filesystem_object_kind,
+            selected_capabilities,
+            audited_path=instruction.audited_path,
+            parent_directory_path=instruction.parent_directory_evidence_path,
+            parent_directory_file_descriptor=(
+                instruction.parent_directory_file_descriptor
+            ),
+            directory_entry_name=instruction.directory_entry_name,
+            evidence_cache=evidence_cache,
+        )
+        if instruction.observation_notes:
+            assessment = self._assessment_with_observation_notes(
+                assessment,
+                instruction.observation_notes,
+            )
+        if (
+            instruction.path_was_explicitly_requested
+            and instruction.directory_entry_name in {".", ".."}
+        ):
+            assessment = self._assessment_with_unremovable_dot_component(assessment)
+        if instruction.final_symbolic_link_has_trailing_separator:
+            assessment = (
+                self._assessment_with_unremovable_trailing_separator_symlink(
+                    assessment
+                )
+            )
+            target_instability = self._trailing_separator_target_instability_reason(
+                instruction,
+                assessment,
+            )
+            if target_instability is not None:
+                assessment = self._assessment_with_trailing_target_instability(
+                    assessment,
+                    selected_capabilities,
+                    target_instability,
+                )
+        identity_instability = self._entry_identity_instability_reason(
+            parent_directory_file_descriptor=(
+                instruction.parent_directory_file_descriptor
+            ),
+            directory_entry_name=instruction.directory_entry_name,
+            expected_identity=expected_identity,
+            follow_symbolic_link=instruction.entry_lookup_followed_symbolic_link,
+        )
+        if identity_instability is not None:
+            assessment = self._assessment_with_identity_instability(
+                assessment,
+                selected_capabilities,
+                identity_instability,
+            )
+        return assessment
+
+    @staticmethod
+    def _trailing_separator_target_instability_reason(
+        instruction: InspectPathTraversalInstruction,
+        assessment: PathCapabilityAssessment,
+    ) -> Optional[EvidenceReason]:
+        expected_identity = instruction.trailing_separator_target_identity
+        if expected_identity is None:
+            return EvidenceReason(
+                "trailing_separator_symbolic_link_target_identity_was_not_captured",
+                evidence_source="fstatat(2)",
+            )
+
+        assessed_target_metadata = (
+            assessment.resolved_symbolic_link_target_stat_metadata
+        )
+        if assessed_target_metadata is not None:
+            assessed_identity = FilesystemObjectIdentity(
+                device_number=assessed_target_metadata.device_number,
+                inode_number=assessed_target_metadata.inode_number,
+            )
+            if (
+                assessed_identity != expected_identity
+                or assessment.resolved_symbolic_link_target_kind
+                != FILESYSTEM_OBJECT_KIND_DIRECTORY
+            ):
+                return EvidenceReason(
+                    "trailing_separator_symbolic_link_target_changed_during_assessment",
+                    evidence_source="preflight fstatat/fstat target identity",
+                    detail=(
+                        f"preflight={expected_identity}; assessed={assessed_identity}; "
+                        "assessed_kind="
+                        f"{assessment.resolved_symbolic_link_target_kind}"
+                    ),
+                )
+
+        try:
+            current_target_metadata = os.stat(
+                instruction.directory_entry_name,
+                dir_fd=instruction.parent_directory_file_descriptor,
+                follow_symlinks=True,
+            )
+        except OSError as error:
+            return operating_system_error_reason(
+                "trailing_separator_symbolic_link_target_changed_during_assessment",
+                error,
+                evidence_source="fstatat(2)",
+            )
+        current_identity = FilesystemObjectIdentity.from_stat_result(
+            current_target_metadata
+        )
+        if (
+            current_identity != expected_identity
+            or not stat.S_ISDIR(current_target_metadata.st_mode)
+        ):
+            return EvidenceReason(
+                "trailing_separator_symbolic_link_target_changed_during_assessment",
+                evidence_source="preflight/post-assessment fstatat target identity",
+                detail=(
+                    f"preflight={expected_identity}; current={current_identity}; "
+                    f"current_kind={classify_filesystem_object_kind(current_target_metadata)}"
+                ),
+            )
+        return None
+
+    @classmethod
+    def _assessment_with_trailing_target_instability(
+        cls,
+        assessment: PathCapabilityAssessment,
+        selected_capabilities: Sequence[str],
+        instability_reason: EvidenceReason,
+    ) -> PathCapabilityAssessment:
+        updated_inferences = dict(assessment.inference_by_capability_name)
+        for capability_name in selected_capabilities:
+            if capability_name == CAPABILITY_DELETE_ENTRY_OR_TREE:
+                continue
+            existing_inference = assessment.inference_for_capability(capability_name)
+            updated_inferences[capability_name] = capability_inference(
+                capability_name,
+                MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                (*existing_inference.evidence_reasons, instability_reason),
+            )
+        return PathCapabilityAssessment(
+            filesystem_object_kind=assessment.filesystem_object_kind,
+            audited_path=assessment.audited_path,
+            inference_by_capability_name=updated_inferences,
+            assessment_completed_at_utc=assessment.assessment_completed_at_utc,
+            observation_notes=tuple(
+                deduplicate_preserving_first_occurrence(
+                    (*assessment.observation_notes, instability_reason)
+                )
+            ),
+            audited_path_lstat_metadata=assessment.audited_path_lstat_metadata,
+            resolved_symbolic_link_target_path=(
+                assessment.resolved_symbolic_link_target_path
+            ),
+            resolved_symbolic_link_target_kind=(
+                assessment.resolved_symbolic_link_target_kind
+            ),
+            resolved_symbolic_link_target_stat_metadata=(
+                assessment.resolved_symbolic_link_target_stat_metadata
+            ),
+        )
+
     @staticmethod
     def _captured_object_evidence_cache(
         *,
@@ -4048,7 +4365,7 @@ class LinuxFilesystemMutationPermissionAuditor:
     @staticmethod
     def _close_directory_iterator(
         directory_state: DirectoryPostorderAssessmentState,
-        open_directory_iterators: list[os.ScandirIterator],
+        open_directory_iterators: list[DirectoryEntryIterator],
     ) -> None:
         directory_iterator = directory_state.directory_iterator
         if directory_iterator is None:
@@ -4204,6 +4521,51 @@ class LinuxFilesystemMutationPermissionAuditor:
         )
 
     @staticmethod
+    def _assessment_with_unremovable_trailing_separator_symlink(
+        assessment: PathCapabilityAssessment,
+    ) -> PathCapabilityAssessment:
+        """Apply unlink/rmdir semantics to a final symlink spelled with ``/``."""
+        if assessment.filesystem_object_kind != FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK:
+            return assessment
+        delete_inference = assessment.inference_by_capability_name.get(
+            CAPABILITY_DELETE_ENTRY_OR_TREE
+        )
+        if delete_inference is None:
+            return assessment
+        updated_inferences = dict(assessment.inference_by_capability_name)
+        updated_inferences[CAPABILITY_DELETE_ENTRY_OR_TREE] = capability_inference(
+            CAPABILITY_DELETE_ENTRY_OR_TREE,
+            MODEL_VERDICT_INDICATES_BLOCKED,
+            (
+                EvidenceReason(
+                    "requested_trailing_separator_forces_final_symbolic_link_following",
+                    evidence_source="unlinkat(2)/rmdir(2) pathname semantics",
+                    detail=(
+                        "the requested spelling cannot remove either the symbolic "
+                        "link entry or its resolved target directory"
+                    ),
+                ),
+            ),
+        )
+        return PathCapabilityAssessment(
+            filesystem_object_kind=assessment.filesystem_object_kind,
+            audited_path=assessment.audited_path,
+            inference_by_capability_name=updated_inferences,
+            assessment_completed_at_utc=assessment.assessment_completed_at_utc,
+            observation_notes=assessment.observation_notes,
+            audited_path_lstat_metadata=assessment.audited_path_lstat_metadata,
+            resolved_symbolic_link_target_path=(
+                assessment.resolved_symbolic_link_target_path
+            ),
+            resolved_symbolic_link_target_kind=(
+                assessment.resolved_symbolic_link_target_kind
+            ),
+            resolved_symbolic_link_target_stat_metadata=(
+                assessment.resolved_symbolic_link_target_stat_metadata
+            ),
+        )
+
+    @staticmethod
     def _record_direct_child_delete_inference(
         parent_directory_state: DirectoryPostorderAssessmentState | None,
         child_assessment: PathCapabilityAssessment,
@@ -4217,6 +4579,35 @@ class LinuxFilesystemMutationPermissionAuditor:
             return
         if child_delete_inference.model_verdict == MODEL_VERDICT_INSUFFICIENT_EVIDENCE:
             parent_directory_state.has_child_with_uncertain_delete_inference = True
+            uncertainty_grade = uncertainty_grade_for_reason_sequence(
+                child_delete_inference.evidence_reasons
+            ) or UNCERTAINTY_GRADE_MATERIAL
+            witness_reason = next(
+                (
+                    reason
+                    for reason in child_delete_inference.evidence_reasons
+                    if evidence_reason_uncertainty_grade(reason) == uncertainty_grade
+                ),
+                (
+                    child_delete_inference.evidence_reasons[0]
+                    if child_delete_inference.evidence_reasons
+                    else EvidenceReason(
+                        "child_delete_inference_is_uncertain_without_a_reason",
+                        evidence_source="postorder traversal aggregation",
+                    )
+                ),
+            )
+            candidate = DescendantDeleteUncertainty(
+                uncertainty_grade=uncertainty_grade,
+                descendant_path=child_assessment.audited_path,
+                descendant_reason_code=witness_reason.reason_code,
+            )
+            retained = parent_directory_state.highest_child_delete_uncertainty
+            if retained is None or (
+                retained.uncertainty_grade == UNCERTAINTY_GRADE_ROUTINE
+                and candidate.uncertainty_grade == UNCERTAINTY_GRADE_MATERIAL
+            ):
+                parent_directory_state.highest_child_delete_uncertainty = candidate
         elif child_delete_inference.model_verdict in {
             MODEL_VERDICT_INDICATES_BLOCKED,
             MODEL_VERDICT_SKIPPED,
@@ -4904,6 +5295,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         parent_directory_path: str | None = None,
         evidence_cache: PathAssessmentEvidenceCache | None = None,
         has_uncertain_descendant_delete: bool,
+        descendant_delete_uncertainty: DescendantDeleteUncertainty | None = None,
         has_blocked_descendant_delete: bool,
         directory_listing_failure: EvidenceReason | None,
         observation_notes: Sequence[EvidenceReason],
@@ -4954,6 +5346,9 @@ class LinuxFilesystemMutationPermissionAuditor:
                         directory_metadata,
                         has_uncertain_descendant_delete=(
                             has_uncertain_descendant_delete
+                        ),
+                        descendant_delete_uncertainty=(
+                            descendant_delete_uncertainty
                         ),
                         has_blocked_descendant_delete=(has_blocked_descendant_delete),
                         directory_listing_failure=directory_listing_failure,
@@ -5015,6 +5410,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         target_metadata: os.stat_result,
         *,
         has_uncertain_descendant_delete: bool,
+        descendant_delete_uncertainty: DescendantDeleteUncertainty | None = None,
         has_blocked_descendant_delete: bool,
         directory_listing_failure: EvidenceReason | None,
         evidence_cache: PathAssessmentEvidenceCache | None = None,
@@ -5179,10 +5575,32 @@ class LinuxFilesystemMutationPermissionAuditor:
             evidence_reasons.append(directory_listing_failure)
             model_has_uncertain_evidence = True
         if has_uncertain_descendant_delete:
+            retained_descendant_uncertainty = descendant_delete_uncertainty
+            descendant_reason_code = (
+                "at_least_one_descendant_has_material_uncertain_delete_inference"
+                if retained_descendant_uncertainty is not None
+                and retained_descendant_uncertainty.uncertainty_grade
+                == UNCERTAINTY_GRADE_MATERIAL
+                else "at_least_one_descendant_has_uncertain_delete_inference"
+            )
+            descendant_detail = None
+            if retained_descendant_uncertainty is not None:
+                descendant_path_bytes_base64 = linux_path_bytes_base64(
+                    retained_descendant_uncertainty.descendant_path
+                )
+                descendant_detail = (
+                    "descendant_path="
+                    f"{quote_path_for_diagnostic(retained_descendant_uncertainty.descendant_path)}; "
+                    "descendant_path_bytes_base64="
+                    f"{descendant_path_bytes_base64}; "
+                    "descendant_reason_code="
+                    f"{retained_descendant_uncertainty.descendant_reason_code}"
+                )
             evidence_reasons.append(
                 EvidenceReason(
-                    "at_least_one_descendant_has_uncertain_delete_inference",
+                    descendant_reason_code,
                     evidence_source="postorder traversal aggregation",
+                    detail=descendant_detail,
                 )
             )
             model_has_uncertain_evidence = True
@@ -6603,8 +7021,8 @@ class AuditScopeEvidence:
     """Observed exclusions and internal artifacts bounding one traversal."""
 
     exclusion_rules: tuple[PathExclusionRule, ...]
-    home_directory_discovery: HomeDirectoryDiscoveryEvidence | None
-    temporary_directory_discovery: TemporaryDirectoryDiscoveryEvidence | None
+    home_directory_discovery: Optional[HomeDirectoryDiscoveryEvidence]
+    temporary_directory_discovery: Optional[TemporaryDirectoryDiscoveryEvidence]
     internally_ignored_paths: tuple[str, ...]
     observed_at_utc: str
 
@@ -6614,12 +7032,12 @@ class ObservedToolSourceFileEvidence:
     """Digest and identity of the source file observed during this run."""
 
     source_file_path: str
-    source_file_sha256: str | None
-    source_file_identity: FilesystemObjectIdentity | None
-    source_file_size_bytes: int | None
-    source_file_modification_time_nanoseconds: int | None
-    source_file_change_time_nanoseconds: int | None
-    uncertainty_reason: EvidenceReason | None
+    source_file_sha256: Optional[str]
+    source_file_identity: Optional[FilesystemObjectIdentity]
+    source_file_size_bytes: Optional[int]
+    source_file_modification_time_nanoseconds: Optional[int]
+    source_file_change_time_nanoseconds: Optional[int]
+    uncertainty_reason: Optional[EvidenceReason]
     observed_at_utc: str
 
 
@@ -6690,6 +7108,7 @@ class AuditRunProvenance:
     tool_name: str
     tool_version: str
     capability_model_id: str
+    loaded_module_code_sha256: str
     process_id: int
     linux_kernel_release: str
     observed_tool_source_file: ObservedToolSourceFileEvidence
@@ -6703,7 +7122,7 @@ class AuditRunProvenance:
     path_record_emission_policy: str
     filesystem_types_with_unmodeled_mutation_semantics: tuple[str, ...]
     report_transport: str
-    requested_report_destination_path: str | None
+    requested_report_destination_path: Optional[str]
     existing_report_replacement_was_authorized: bool
 
     def as_serializable_dictionary(
@@ -6723,6 +7142,9 @@ class AuditRunProvenance:
                 source_file_evidence.source_file_change_time_nanoseconds
             ),
             "observed_at_utc": source_file_evidence.observed_at_utc,
+            "relationship_to_loaded_code": (
+                "observed_path_snapshot_not_execution_identity"
+            ),
         }
         if source_file_evidence.source_file_identity is not None:
             source_file_dictionary["source_file_identity"] = {
@@ -6917,6 +7339,10 @@ class AuditRunProvenance:
             "tool_name": self.tool_name,
             "tool_version": self.tool_version,
             "capability_model_id": self.capability_model_id,
+            "loaded_module_code": {
+                "identity_kind": "sha256_of_marshaled_executing_module_code_object",
+                "sha256": self.loaded_module_code_sha256,
+            },
             "process_id": self.process_id,
             "linux_kernel_release": self.linux_kernel_release,
             "linux_system_interface_support": {
@@ -7006,6 +7432,7 @@ def build_audit_run_provenance(
         tool_name=AUDIT_TOOL_NAME,
         tool_version=AUDIT_TOOL_VERSION,
         capability_model_id=CAPABILITY_MODEL_ID,
+        loaded_module_code_sha256=LOADED_MODULE_CODE_SHA256,
         process_id=os.getpid(),
         linux_kernel_release=RUNNING_LINUX_KERNEL_RELEASE,
         observed_tool_source_file=observed_tool_source_file,
@@ -7514,10 +7941,15 @@ def iterate_structured_path_audit_records(
 
 def escape_linux_path_text_for_terminal(path_text: str) -> str:
     """Render arbitrary Linux filename bytes on exactly one terminal line."""
-    # Most paths need no escaping.  str.isprintable performs its scan in C;
-    # quotes and backslashes are the only printable characters transformed by
-    # the complete encoder below.
-    if path_text.isprintable() and "\\" not in path_text and '"' not in path_text:
+    # Restrict raw output to unambiguous printable ASCII.  Unicode characters
+    # that are nominally printable can still reorder, join, hide, or change the
+    # presentation of neighboring filename characters.
+    if (
+        path_text.isascii()
+        and path_text.isprintable()
+        and "\\" not in path_text
+        and '"' not in path_text
+    ):
         return path_text
 
     escaped_characters: list[str] = []
@@ -7539,12 +7971,11 @@ def escape_linux_path_text_for_terminal(path_text: str) -> str:
             escaped_characters.append(short_control_escape_by_character[character])
         elif 0xDC80 <= character_codepoint <= 0xDCFF:
             escaped_characters.append(f"\\x{character_codepoint - 0xDC00:02x}")
-        elif (
-            0xD800 <= character_codepoint <= 0xDFFF
-            or character_codepoint < 0x20
-            or character_codepoint == 0x7F
-        ):
-            escaped_characters.append(f"\\u{character_codepoint:04x}")
+        elif character_codepoint > 0x7E or not character.isprintable():
+            if character_codepoint <= 0xFFFF:
+                escaped_characters.append(f"\\u{character_codepoint:04x}")
+            else:
+                escaped_characters.append(f"\\U{character_codepoint:08x}")
         else:
             escaped_characters.append(character)
 
@@ -7571,9 +8002,13 @@ def terminal_path_description(record: StructuredPathAuditRecord) -> str:
             and displayed_target_path != "/"
         ):
             displayed_target_path += "/"
-        displayed_audited_path += f" -> {displayed_target_path}"
+        return (
+            f'"{escape_linux_path_text_for_terminal(displayed_audited_path)}"'
+            " -> "
+            f'"{escape_linux_path_text_for_terminal(displayed_target_path)}"'
+        )
 
-    return escape_linux_path_text_for_terminal(displayed_audited_path)
+    return f'"{escape_linux_path_text_for_terminal(displayed_audited_path)}"'
 
 
 def terminal_allowed_capability_label(record: StructuredPathAuditRecord) -> str:
@@ -7785,6 +8220,53 @@ class AuditReportTransportError(Exception):
     """A failure to carry complete audit output to the selected stream."""
 
 
+LINUX_PATH_SERIALIZATION_FIELD_NAMES = frozenset(
+    {
+        "mount_point",
+        "selected_writable_temporary_directory",
+    }
+)
+
+
+def linux_path_bytes_base64(path: str) -> str:
+    """Return a reversible representation of the filename bytes in ``path``."""
+    return base64.b64encode(os.fsencode(path)).decode("ascii")
+
+
+def add_linux_path_byte_representations(value: object) -> object:
+    """Add base64 sidecars for every structured filesystem-path field."""
+    if isinstance(value, Mapping):
+        serialized_mapping: dict[object, object] = {}
+        for key, child_value in value.items():
+            serialized_mapping[key] = add_linux_path_byte_representations(
+                child_value
+            )
+            if not isinstance(key, str):
+                continue
+            field_is_path = (
+                key.endswith("_path")
+                or key.endswith("_paths")
+                or key in LINUX_PATH_SERIALIZATION_FIELD_NAMES
+            )
+            if not field_is_path:
+                continue
+            sidecar_key = f"{key}_bytes_base64"
+            if isinstance(child_value, str):
+                serialized_mapping[sidecar_key] = linux_path_bytes_base64(
+                    child_value
+                )
+            elif isinstance(child_value, (list, tuple)) and all(
+                isinstance(path, str) for path in child_value
+            ):
+                serialized_mapping[sidecar_key] = [
+                    linux_path_bytes_base64(path) for path in child_value
+                ]
+        return serialized_mapping
+    if isinstance(value, (list, tuple)):
+        return [add_linux_path_byte_representations(item) for item in value]
+    return value
+
+
 def write_json_line_to_audit_report(
     serializable_record: Mapping[str, object],
     *,
@@ -7793,7 +8275,7 @@ def write_json_line_to_audit_report(
     """Serialize one complete record before attempting a single stream write."""
     serialized_json_line = (
         json.dumps(
-            serializable_record,
+            add_linux_path_byte_representations(serializable_record),
             ensure_ascii=True,
             sort_keys=False,
         )
@@ -7808,6 +8290,10 @@ def write_json_line_to_audit_report(
 
 class ReportPublicationError(Exception):
     """A user-actionable private-report lifecycle failure."""
+
+
+class ReportPublicationPartiallyCompletedError(ReportPublicationError):
+    """The new report is visible but final directory durability is uncertain."""
 
 
 def quote_path_for_diagnostic(path: str) -> str:
@@ -7957,11 +8443,19 @@ class PrivateReportPublication:
         try:
             self._open_destination_directory()
             self._open_unpublished_report()
-        except BaseException:
+        except BaseException as error:
             self._close_report_stream_without_masking_original_error()
             self._remove_unpublished_report_if_identity_still_matches()
             self._close_destination_directory_without_masking_original_error()
-            raise
+            if isinstance(error, ReportPublicationError) or not isinstance(
+                error,
+                (OSError, UnicodeError, ValueError),
+            ):
+                raise
+            raise ReportPublicationError(
+                "cannot prepare report publication for "
+                f"{quote_path_for_diagnostic(self.destination_path)}: {error}"
+            ) from error
         return self
 
     def __exit__(
@@ -7979,7 +8473,17 @@ class PrivateReportPublication:
             try:
                 self._flush_synchronize_and_close_complete_report()
                 self._conditionally_publish_synchronized_report()
-                self._synchronize_destination_directory()
+                try:
+                    self._synchronize_destination_directory()
+                except (OSError, ValueError) as error:
+                    if self.created_report_was_published_to_destination:
+                        raise ReportPublicationPartiallyCompletedError(
+                            "the synchronized report is published at "
+                            f"{quote_path_for_diagnostic(self.destination_path)}, "
+                            "but final destination-directory durability could "
+                            f"not be confirmed: {error}"
+                        ) from error
+                    raise
             except ReportPublicationError:
                 self._close_report_stream_without_masking_original_error()
                 self._remove_unpublished_report_if_identity_still_matches()
@@ -8004,10 +8508,17 @@ class PrivateReportPublication:
         directory_open_flags = os.O_RDONLY
         directory_open_flags |= getattr(os, "O_CLOEXEC", 0)
         directory_open_flags |= getattr(os, "O_DIRECTORY", 0)
-        destination_directory_file_descriptor = os.open(
-            self.destination_parent_directory_path,
-            directory_open_flags,
-        )
+        try:
+            destination_directory_file_descriptor = os.open(
+                self.destination_parent_directory_path,
+                directory_open_flags,
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ReportPublicationError(
+                "cannot open report destination parent directory "
+                f"{quote_path_for_diagnostic(self.destination_parent_directory_path)}: "
+                f"{error}"
+            ) from error
         try:
             opened_directory_metadata = os.fstat(destination_directory_file_descriptor)
             if not stat.S_ISDIR(opened_directory_metadata.st_mode):
@@ -8054,6 +8565,43 @@ class PrivateReportPublication:
         self.destination_path = lexically_normalize_absolute_path(
             os.path.join(canonical_parent_path, self.destination_entry_name)
         )
+
+    def destination_is_requested_scan_root(self, scan_root_path: str) -> bool:
+        """Compare directory-entry identity without requiring either entry to exist."""
+        requested_scan_root = split_requested_path_without_normalizing(
+            scan_root_path
+        )
+        if requested_scan_root.final_component != self.destination_entry_name:
+            return False
+
+        parent_open_flags = getattr(os, "O_PATH", 0o10000000)
+        parent_open_flags |= getattr(os, "O_CLOEXEC", 0)
+        parent_open_flags |= getattr(os, "O_DIRECTORY", 0)
+        try:
+            scan_parent_file_descriptor = os.open(
+                requested_scan_root.parent_path_with_dot_components,
+                parent_open_flags,
+            )
+        except OSError as error:
+            raise ReportPublicationError(
+                "cannot establish that report destination differs from scan root "
+                f"{quote_path_for_diagnostic(scan_root_path)}: {error}"
+            ) from error
+        try:
+            try:
+                return FilesystemObjectIdentity.from_stat_result(
+                    os.fstat(scan_parent_file_descriptor)
+                ) == FilesystemObjectIdentity.from_stat_result(
+                    os.fstat(self._require_destination_directory_file_descriptor())
+                )
+            except OSError as error:
+                raise ReportPublicationError(
+                    "cannot compare report destination with requested scan root "
+                    f"{quote_path_for_diagnostic(scan_root_path)}: {error}"
+                ) from error
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(scan_parent_file_descriptor)
 
     def _require_destination_directory_file_descriptor(self) -> int:
         if self.destination_directory_file_descriptor is None:
@@ -8246,13 +8794,82 @@ class PrivateReportPublication:
                     f"{quote_path_for_diagnostic(self.destination_path)}"
                 ) from error
             self.temporary_entry_contains_created_report = False
-            self._verify_destination_contains_created_report()
+            try:
+                self._verify_destination_contains_created_report()
+            except BaseException as validation_error:
+                self._restore_new_destination_after_failed_validation(
+                    validation_error
+                )
+                raise
             self.created_report_was_published_to_destination = True
             return
 
         self._exchange_with_observed_destination_and_validate(
             pre_audit_destination_observation
         )
+
+    def _restore_new_destination_after_failed_validation(
+        self,
+        validation_error: BaseException,
+    ) -> None:
+        """Reverse a first publication when its post-rename check fails."""
+        if self.unpublished_report_entry_name is None:
+            raise ReportPublicationPartiallyCompletedError(
+                "new report validation failed after publication and the "
+                "temporary entry name needed for reversal is missing"
+            ) from validation_error
+        destination_directory_file_descriptor = (
+            self._require_destination_directory_file_descriptor()
+        )
+        try:
+            destination_metadata = lstat_directory_entry_if_present(
+                destination_directory_file_descriptor,
+                self.destination_entry_name,
+            )
+        except BaseException as observation_error:
+            raise ReportPublicationPartiallyCompletedError(
+                "new report validation failed after publication and the "
+                "visible destination could not be identified safely: "
+                f"{observation_error}"
+            ) from validation_error
+        destination_contains_created_report = (
+            destination_metadata is not None
+            and stat.S_ISREG(destination_metadata.st_mode)
+            and FilesystemObjectIdentity.from_stat_result(destination_metadata)
+            == self.created_report_identity
+        )
+        if not destination_contains_created_report:
+            raise ReportPublicationPartiallyCompletedError(
+                "new report validation failed after publication and the "
+                "destination no longer identifies the created report; no "
+                "destructive rollback was attempted"
+            ) from validation_error
+
+        self.created_report_was_published_to_destination = True
+        try:
+            rename_linux_directory_entry_with_flags(
+                destination_directory_file_descriptor,
+                self.destination_entry_name,
+                destination_directory_file_descriptor,
+                self.unpublished_report_entry_name,
+                RENAME_NOREPLACE,
+            )
+        except BaseException as rollback_error:
+            raise ReportPublicationPartiallyCompletedError(
+                "new report validation failed after publication and the "
+                "visible report could not be moved back to its private "
+                f"temporary entry: {rollback_error}"
+            ) from validation_error
+        self.temporary_entry_contains_created_report = True
+        self.created_report_was_published_to_destination = False
+        try:
+            self._verify_temporary_entry_contains_created_report()
+        except BaseException as rollback_validation_error:
+            raise ReportPublicationPartiallyCompletedError(
+                "new report validation failed, its directory entry was moved "
+                "out of the destination, but rollback identity validation "
+                f"also failed: {rollback_validation_error}"
+            ) from validation_error
 
     def _exchange_with_observed_destination_and_validate(
         self,
@@ -8317,6 +8934,16 @@ class PrivateReportPublication:
                 )
         except BaseException as publication_error:
             self._exchange_entries_back_after_failed_validation(publication_error)
+            raise
+
+        try:
+            # Make the validated exchange durable while the displaced file is
+            # still available for an atomic reversal.
+            self._synchronize_destination_directory()
+        except BaseException as synchronization_error:
+            self._exchange_entries_back_after_failed_validation(
+                synchronization_error
+            )
             raise
 
         self.created_report_was_published_to_destination = True
@@ -8718,6 +9345,21 @@ def run_audit_command(command_line_arguments: Sequence[str]) -> int:
                     raise ReportPublicationError(
                         "internal invariant failed: report stream unavailable"
                     )
+                overlapping_scan_root = next(
+                    (
+                        scan_root_path
+                        for scan_root_path in configuration.scan_root_paths
+                        if report_publication.destination_is_requested_scan_root(
+                            scan_root_path
+                        )
+                    ),
+                    None,
+                )
+                if overlapping_scan_root is not None:
+                    raise ReportPublicationError(
+                        "report destination must not also be an audit scan root: "
+                        f"{quote_path_for_diagnostic(overlapping_scan_root)}"
+                    )
                 audit_execution_result = execute_audit_to_stream(
                     configuration,
                     report_publication.text_stream,
@@ -8729,7 +9371,23 @@ def run_audit_command(command_line_arguments: Sequence[str]) -> int:
                     ),
                 )
     except BrokenPipeError:
-        raise
+        redirect_standard_output_to_devnull_after_broken_pipe()
+        write_diagnostic_to_standard_error(
+            f"{AUDIT_TOOL_NAME}: report transport ended before the complete "
+            "audit could be delivered\n"
+        )
+        return EXIT_AUDIT_REPORT_INCOMPLETE
+    except AuditScopeConflictError as error:
+        write_diagnostic_to_standard_error(
+            f"{AUDIT_TOOL_NAME}: report publication refused because audit "
+            f"scope overlaps report transport: {error}\n"
+        )
+        return EXIT_REPORT_OUTPUT_FAILED
+    except ReportPublicationPartiallyCompletedError as error:
+        write_diagnostic_to_standard_error(
+            f"{AUDIT_TOOL_NAME}: report publication partially completed: {error}\n"
+        )
+        return EXIT_REPORT_OUTPUT_FAILED
     except ReportPublicationError as error:
         write_diagnostic_to_standard_error(
             f"{AUDIT_TOOL_NAME}: report publication failed: {error}\n"
@@ -8800,7 +9458,7 @@ if __name__ == "__main__":
         raise SystemExit(run_audit_command(sys.argv[1:]))
     except BrokenPipeError:
         redirect_standard_output_to_devnull_after_broken_pipe()
-        raise SystemExit(EXIT_AUDIT_COMPLETED) from None
+        raise SystemExit(EXIT_AUDIT_REPORT_INCOMPLETE) from None
     except KeyboardInterrupt:
         with contextlib.suppress(OSError, UnicodeError):
             write_diagnostic_to_standard_error("\n")

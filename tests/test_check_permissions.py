@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import dataclasses
 import errno
+import base64
 import hashlib
 import io
+import importlib.util
 import json
 import os
 import shutil
@@ -14,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import typing
 import unittest
 import uuid
 from dataclasses import replace
@@ -329,6 +333,128 @@ class PermissionInferenceVerificationTests(unittest.TestCase):
             .evidence_reasons[0]
             .reason_code,
             "requested_path_component_is_not_a_directory",
+        )
+
+    def test_trailing_separator_symlink_is_not_misclassified_as_target_tree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            target_directory = fixture_root / "target"
+            target_directory.mkdir()
+            (target_directory / "descendant").write_bytes(b"descendant")
+            symbolic_link = fixture_root / "link"
+            symbolic_link.symlink_to(target_directory.name)
+
+            with inode_attributes_observed_clear():
+                assessments = list(
+                    permission_auditor().assess_path_tree(
+                        str(symbolic_link) + "/",
+                        selected_capabilities=(
+                            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                            audit_under_test.CAPABILITY_CREATE_DIRECTORY_ENTRY,
+                        ),
+                    )
+                )
+
+        self.assertEqual(len(assessments), 1)
+        assessment = assessments[0]
+        self.assertEqual(
+            assessment.filesystem_object_kind,
+            audit_under_test.FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK,
+        )
+        self.assertEqual(
+            assessment.resolved_symbolic_link_target_kind,
+            audit_under_test.FILESYSTEM_OBJECT_KIND_DIRECTORY,
+        )
+        delete_inference = assessment.inference_for_capability(
+            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
+        )
+        self.assertEqual(
+            delete_inference.model_verdict,
+            audit_under_test.MODEL_VERDICT_INDICATES_BLOCKED,
+        )
+        self.assertEqual(
+            {reason.reason_code for reason in delete_inference.evidence_reasons},
+            {
+                "requested_trailing_separator_forces_final_symbolic_link_following"
+            },
+        )
+
+    def test_trailing_separator_symlink_target_swap_makes_following_inference_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            target = fixture_root / "target"
+            target.mkdir()
+            symbolic_link = fixture_root / "link"
+            symbolic_link.symlink_to(target.name)
+            active_auditor = permission_auditor()
+            assess_normally = active_auditor.assess_non_directory_path
+
+            def replace_target_then_assess(*args, **kwargs):
+                target.rmdir()
+                target.write_bytes(b"replacement")
+                return assess_normally(*args, **kwargs)
+
+            with mock.patch.object(
+                active_auditor,
+                "assess_non_directory_path",
+                side_effect=replace_target_then_assess,
+            ):
+                assessment = assess_one_path(
+                    str(symbolic_link) + "/",
+                    (
+                        audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                        audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                    ),
+                    auditor=active_auditor,
+                )
+
+        self.assertEqual(
+            assessment.inference_for_capability(
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
+            ).model_verdict,
+            audit_under_test.MODEL_VERDICT_INDICATES_BLOCKED,
+        )
+        append_inference = assessment.inference_for_capability(
+            audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT
+        )
+        self.assertEqual(
+            append_inference.model_verdict,
+            audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+        )
+        self.assertIn(
+            "trailing_separator_symbolic_link_target_changed_during_assessment",
+            {reason.reason_code for reason in append_inference.evidence_reasons},
+        )
+
+    def test_trailing_separator_exclusion_matches_symlink_not_target_tree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            target = fixture_root / "target"
+            target.mkdir()
+            symbolic_link = fixture_root / "link"
+            symbolic_link.symlink_to(target.name)
+            exclusion_rule = audit_under_test.path_exclusion_rule_from_user_argument(
+                str(symbolic_link) + "/"
+            )
+            assessment = assess_one_path(
+                str(symbolic_link) + "/",
+                (audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,),
+                auditor=permission_auditor(exclusion_rules=(exclusion_rule,)),
+            )
+
+        self.assertEqual(exclusion_rule.excluded_path, str(symbolic_link))
+        self.assertFalse(exclusion_rule.includes_descendants)
+        self.assertEqual(
+            assessment.inference_for_capability(
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
+            ).model_verdict,
+            audit_under_test.MODEL_VERDICT_SKIPPED,
         )
 
     def test_requested_missing_name_is_revalidated_after_assessment(self) -> None:
@@ -1541,6 +1667,41 @@ class EvidenceUncertaintyVerificationTests(unittest.TestCase):
 
 
 class DirectoryTraversalVerificationTests(unittest.TestCase):
+    def test_every_dataclass_type_hint_resolves_on_supported_runtimes(self) -> None:
+        dataclass_types = [
+            value
+            for value in vars(audit_under_test).values()
+            if isinstance(value, type) and dataclasses.is_dataclass(value)
+        ]
+        for dataclass_type in dataclass_types:
+            hints = typing.get_type_hints(dataclass_type)
+            if "directory_iterator" in hints:
+                self.assertNotIn(
+                    "os.ScandirIterator",
+                    repr(hints["directory_iterator"]),
+                )
+
+    def test_live_filename_ending_deleted_is_not_reported_as_unlinked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            live_path = Path(temporary_directory) / "literal (deleted)"
+            live_path.write_bytes(b"live")
+            descriptor = os.open(
+                live_path,
+                getattr(os, "O_PATH", 0o10000000),
+            )
+            try:
+                observed_path, observation_note = (
+                    audit_under_test.observe_canonical_path_for_file_descriptor(
+                        descriptor,
+                        fallback_path=str(live_path),
+                    )
+                )
+            finally:
+                os.close(descriptor)
+
+        self.assertEqual(observed_path, str(live_path))
+        self.assertIsNone(observation_note)
+
     def test_child_metadata_failures_become_path_and_parent_uncertainty(
         self,
     ) -> None:
@@ -1831,6 +1992,81 @@ class DirectoryTraversalVerificationTests(unittest.TestCase):
             audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
         )
 
+    def test_material_child_delete_uncertainty_propagates_through_ancestors(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_directory = Path(temporary_directory) / "root"
+            child_directory = root_directory / "child"
+            child_directory.mkdir(parents=True)
+            leaf_path = child_directory / "leaf"
+            leaf_path.write_bytes(b"leaf")
+            active_auditor = permission_auditor()
+            assess_leaf_normally = active_auditor.assess_non_directory_path
+
+            def assess_leaf_with_material_failure(*args, **kwargs):
+                assessment = assess_leaf_normally(*args, **kwargs)
+                if assessment.audited_path != str(leaf_path):
+                    return assessment
+                return active_auditor._same_verdict_for_all_capabilities(
+                    filesystem_object_kind=assessment.filesystem_object_kind,
+                    audited_path=assessment.audited_path,
+                    selected_capabilities=(
+                        audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                    ),
+                    model_verdict=(
+                        audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE
+                    ),
+                    evidence_reasons=(
+                        audit_under_test.EvidenceReason(
+                            "cannot_observe_simulated_leaf_identity",
+                            evidence_source="test",
+                        ),
+                    ),
+                )
+
+            with (
+                mock.patch.object(
+                    active_auditor,
+                    "assess_non_directory_path",
+                    side_effect=assess_leaf_with_material_failure,
+                ),
+                inode_attributes_observed_clear(),
+            ):
+                assessments = list(
+                    active_auditor.assess_path_tree(
+                        str(root_directory),
+                        selected_capabilities=(
+                            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                        ),
+                    )
+                )
+
+        assessment_by_path = {
+            assessment.audited_path: assessment for assessment in assessments
+        }
+        for ancestor_path in (child_directory, root_directory):
+            delete_inference = assessment_by_path[str(ancestor_path)].inference_for_capability(
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
+            )
+            self.assertEqual(
+                delete_inference.model_verdict,
+                audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+            )
+            material_aggregation_reason = next(
+                reason
+                for reason in delete_inference.evidence_reasons
+                if reason.reason_code
+                == "at_least_one_descendant_has_material_uncertain_delete_inference"
+            )
+            self.assertEqual(
+                audit_under_test.evidence_reason_uncertainty_grade(
+                    material_aggregation_reason
+                ),
+                audit_under_test.UNCERTAINTY_GRADE_MATERIAL,
+            )
+            self.assertIn("descendant_path_bytes_base64=", material_aggregation_reason.detail)
+
     def test_file_descriptor_exhaustion_stops_scope_with_named_uncertainty(
         self,
     ) -> None:
@@ -2010,6 +2246,31 @@ class DirectoryTraversalVerificationTests(unittest.TestCase):
 
 
 class LinuxMountEvidenceVerificationTests(unittest.TestCase):
+    def test_mountinfo_octal_escape_and_summary_preserve_high_filename_byte(
+        self,
+    ) -> None:
+        decoded_mount_point = audit_under_test.unescape_linux_mountinfo_field(
+            r"/mount/bad-\377"
+        )
+        self.assertEqual(os.fsencode(decoded_mount_point), b"/mount/bad-\xff")
+        mount_record = audit_under_test.LinuxMountRecord(
+            mount_id=10,
+            parent_mount_id=1,
+            mount_point=decoded_mount_point,
+            filesystem_type="testfs",
+            mount_options=("rw",),
+            superblock_options=("rw",),
+            mountinfo_line_number=1,
+        )
+        summary = audit_under_test.linux_mount_record_evidence_summary(mount_record)
+        encoded_mount_point = summary.split(
+            "mount_point_bytes_base64=", 1
+        )[1].split(";", 1)[0]
+        self.assertEqual(
+            base64.b64decode(encoded_mount_point),
+            b"/mount/bad-\xff",
+        )
+
     def test_symlink_loop_resolution_becomes_named_mount_uncertainty(
         self,
     ) -> None:
@@ -2630,7 +2891,38 @@ class CommandAndReportTransportContractTests(unittest.TestCase):
 
         self.assertEqual(
             terminal_output.getvalue(),
-            "[daocs] /scope/link\\nname -> /target/directory/\n",
+            '[daocs] "/scope/link\\nname" -> "/target/directory/"\n',
+        )
+
+    def test_terminal_paths_escape_unicode_formatting_and_quote_link_sides(
+        self,
+    ) -> None:
+        dangerous_text = (
+            "name\u0085\u202e\u2028\u200b\u034f\u0301\ufe0f"
+            "\U000e0100\u115f\u1160\u05d0"
+        )
+        self.assertEqual(
+            audit_under_test.escape_linux_path_text_for_terminal(dangerous_text),
+            (
+                r"name\u0085\u202e\u2028\u200b\u034f\u0301\ufe0f"
+                r"\U000e0100\u115f\u1160\u05d0"
+            ),
+        )
+        ambiguous_symbolic_link_record = mock.Mock(
+            audited_path="/scope/a -> b",
+            filesystem_object_kind=(
+                audit_under_test.FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK
+            ),
+            resolved_symbolic_link_target_path="target -> destination",
+            resolved_symbolic_link_target_kind=(
+                audit_under_test.FILESYSTEM_OBJECT_KIND_REGULAR_FILE
+            ),
+        )
+        self.assertEqual(
+            audit_under_test.terminal_path_description(
+                ambiguous_symbolic_link_record
+            ),
+            '"/scope/a -> b" -> "target -> destination"',
         )
 
     def test_human_override_writes_paths_to_a_private_output_file(self) -> None:
@@ -2753,8 +3045,75 @@ class CommandAndReportTransportContractTests(unittest.TestCase):
                 output_stream=short_writing_stream,
             )
 
+    def test_broken_stdout_pipe_before_completion_has_incomplete_exit_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_directory = Path(temporary_directory) / "audited"
+            audited_directory.mkdir()
+            for child_number in range(512):
+                (audited_directory / f"child-{child_number:04d}").write_bytes(b"x")
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(AUDIT_SCRIPT_PATH),
+                    "--allow-root-audit",
+                    "--full-audit",
+                    str(audited_directory),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            assert process.stdout is not None
+            assert process.stderr is not None
+            first_record = process.stdout.readline()
+            process.stdout.close()
+            standard_error = process.stderr.read()
+            process.stderr.close()
+            return_code = process.wait(timeout=30)
+
+        self.assertTrue(first_record)
+        self.assertEqual(
+            return_code,
+            audit_under_test.EXIT_AUDIT_REPORT_INCOMPLETE,
+        )
+        self.assertIn(b"before the complete audit", standard_error)
+
 
 class JsonlEvidenceContractTests(unittest.TestCase):
+    def test_loaded_code_identity_survives_source_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            copied_module_path = Path(temporary_directory) / "copied_auditor.py"
+            copied_module_path.write_bytes(AUDIT_SCRIPT_PATH.read_bytes())
+            module_name = f"copied_auditor_{uuid.uuid4().hex}"
+            module_specification = importlib.util.spec_from_file_location(
+                module_name,
+                copied_module_path,
+            )
+            assert module_specification is not None
+            assert module_specification.loader is not None
+            copied_module = importlib.util.module_from_spec(module_specification)
+            sys.modules[module_name] = copied_module
+            try:
+                module_specification.loader.exec_module(copied_module)
+                loaded_code_digest = copied_module.LOADED_MODULE_CODE_SHA256
+                replacement_source = b"# replacement after module execution\n"
+                copied_module_path.write_bytes(replacement_source)
+                observed_source = copied_module.observe_tool_source_file()
+            finally:
+                sys.modules.pop(module_name, None)
+
+        self.assertEqual(
+            observed_source.source_file_sha256,
+            hashlib.sha256(replacement_source).hexdigest(),
+        )
+        self.assertEqual(
+            copied_module.LOADED_MODULE_CODE_SHA256,
+            loaded_code_digest,
+        )
+        self.assertNotEqual(loaded_code_digest, observed_source.source_file_sha256)
+
     def test_each_path_record_carries_complete_run_and_source_identity(
         self,
     ) -> None:
@@ -2884,6 +3243,20 @@ class JsonlEvidenceContractTests(unittest.TestCase):
             run_provenance["observed_tool_source_file"]["source_file_sha256"],
             hashlib.sha256(AUDIT_SCRIPT_PATH.read_bytes()).hexdigest(),
         )
+        self.assertEqual(
+            run_provenance["loaded_module_code"]["identity_kind"],
+            "sha256_of_marshaled_executing_module_code_object",
+        )
+        self.assertRegex(
+            run_provenance["loaded_module_code"]["sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            run_provenance["observed_tool_source_file"][
+                "relationship_to_loaded_code"
+            ],
+            "observed_path_snapshot_not_execution_identity",
+        )
 
     def test_a_report_without_emitted_paths_still_names_its_run(
         self,
@@ -2912,6 +3285,68 @@ class JsonlEvidenceContractTests(unittest.TestCase):
             "audit_run_completion",
         )
         self.assertTrue(decoded_records[1]["audit_algorithm_completed"])
+
+    def test_invalid_utf8_path_bytes_have_reversible_json_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            raw_path = os.fsencode(temporary_directory) + b"/bad-\xff"
+            file_descriptor = os.open(
+                raw_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(file_descriptor)
+            decoded_path = os.fsdecode(raw_path)
+
+            completed_command = run_audit_tool_command(
+                "--full-audit",
+                decoded_path,
+            )
+
+        self.assertEqual(completed_command.returncode, 0, completed_command.stderr)
+        path_record = path_assessment_records_from_jsonl(completed_command.stdout)[0]
+        self.assertEqual(
+            base64.b64decode(path_record["audited_path_bytes_base64"]),
+            raw_path,
+        )
+        self.assertEqual(
+            base64.b64decode(
+                path_record["originating_scan_root_path_bytes_base64"]
+            ),
+            raw_path,
+        )
+        provenance = path_record["audit_run_provenance"]
+        self.assertEqual(
+            base64.b64decode(
+                provenance["requested_scan_root_paths_bytes_base64"][0]
+            ),
+            raw_path,
+        )
+
+    def test_all_named_json_path_fields_receive_byte_representations(self) -> None:
+        source = {
+            "audited_path": "/tmp/a",
+            "resolved_symbolic_link_target_path": "/tmp/b",
+            "requested_scan_root_paths": ["/tmp/c", "/tmp/d"],
+            "selected_writable_temporary_directory": "/tmp",
+            "nested": {"source_path": "/proc/self/mountinfo"},
+        }
+        serialized = audit_under_test.add_linux_path_byte_representations(source)
+
+        self.assertEqual(
+            base64.b64decode(serialized["audited_path_bytes_base64"]),
+            b"/tmp/a",
+        )
+        self.assertEqual(
+            [
+                base64.b64decode(value)
+                for value in serialized["requested_scan_root_paths_bytes_base64"]
+            ],
+            [b"/tmp/c", b"/tmp/d"],
+        )
+        self.assertEqual(
+            base64.b64decode(serialized["nested"]["source_path_bytes_base64"]),
+            b"/proc/self/mountinfo",
+        )
 
 
 class ReportPublicationVerificationTests(unittest.TestCase):
@@ -2970,6 +3405,61 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 b"report",
             )
 
+    def test_symbolic_link_scan_root_aliasing_output_is_refused_before_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            destination_path = fixture_root / "report.jsonl"
+            symbolic_link = fixture_root / "link"
+            symbolic_link.symlink_to(destination_path.name)
+
+            completed_command = run_audit_tool_command(
+                "--full-audit",
+                "--output",
+                str(destination_path),
+                str(symbolic_link),
+            )
+
+            self.assertEqual(
+                completed_command.returncode,
+                audit_under_test.EXIT_REPORT_OUTPUT_FAILED,
+            )
+            self.assertIn(b"scope overlaps report transport", completed_command.stderr)
+            self.assertFalse(destination_path.exists())
+            self.assertTrue(symbolic_link.is_symlink())
+            self.assertEqual(self.unpublished_report_paths(fixture_root), [])
+
+    def test_new_destination_validation_failure_rolls_back_visible_report(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination_directory = Path(temporary_directory)
+            destination_path = destination_directory / "report.jsonl"
+            publication = self.create_report_publication(
+                destination_path,
+                replacement_is_authorized=False,
+            )
+
+            with (
+                self.assertRaises(audit_under_test.ReportPublicationError),
+                mock.patch.object(
+                    publication,
+                    "_verify_destination_contains_created_report",
+                    side_effect=audit_under_test.ReportPublicationError(
+                        "simulated destination validation failure"
+                    ),
+                ),
+                publication,
+            ):
+                assert publication.text_stream is not None
+                publication.text_stream.write('{"complete": true}\n')
+
+            self.assertFalse(destination_path.exists())
+            self.assertFalse(publication.created_report_was_published_to_destination)
+            self.assertFalse(publication.temporary_entry_contains_created_report)
+            self.assertEqual(self.unpublished_report_paths(destination_directory), [])
+
     def test_output_parent_dot_dot_after_symlink_uses_kernel_resolution(
         self,
     ) -> None:
@@ -2999,6 +3489,104 @@ class ReportPublicationVerificationTests(unittest.TestCase):
             self.assertEqual(completed_command.returncode, 0)
             self.assertTrue((kernel_output_directory / "audit.jsonl").is_file())
             self.assertFalse((lexical_output_directory / "audit.jsonl").exists())
+
+    def test_exact_output_and_scan_root_overlap_is_refused_without_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            victim_path = Path(temporary_directory) / "victim"
+            victim_path.write_bytes(b"ORIGINAL")
+
+            completed_command = run_audit_tool_command(
+                "--full-audit",
+                "--replace-output",
+                "--output",
+                str(victim_path),
+                str(victim_path),
+            )
+
+            self.assertEqual(
+                completed_command.returncode,
+                audit_under_test.EXIT_REPORT_OUTPUT_FAILED,
+            )
+            self.assertEqual(victim_path.read_bytes(), b"ORIGINAL")
+            self.assertIn(b"must not also be an audit scan root", completed_command.stderr)
+            self.assertEqual(
+                self.unpublished_report_paths(Path(temporary_directory)),
+                [],
+            )
+
+    def test_missing_report_parent_is_a_report_output_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            audited_file = fixture_root / "audited"
+            audited_file.write_bytes(b"fixture")
+            report_path = fixture_root / "missing" / "report.jsonl"
+
+            completed_command = run_audit_tool_command(
+                "--output",
+                str(report_path),
+                str(audited_file),
+            )
+
+        self.assertEqual(
+            completed_command.returncode,
+            audit_under_test.EXIT_REPORT_OUTPUT_FAILED,
+        )
+        self.assertIn(b"report publication failed", completed_command.stderr)
+
+    def test_unexpected_destination_open_oserror_is_still_an_output_failure(
+        self,
+    ) -> None:
+        diagnostic_stream = io.StringIO()
+        with mock.patch.object(
+            audit_under_test.PrivateReportPublication,
+            "_open_destination_directory",
+            side_effect=OSError(errno.EIO, "simulated destination open failure"),
+        ), contextlib.redirect_stderr(diagnostic_stream):
+            exit_status = audit_under_test.run_audit_command(
+                (
+                    "--allow-root-audit",
+                    "--output",
+                    "/tmp/simulated-report-output",
+                    "/tmp/simulated-audit-root",
+                )
+            )
+
+        self.assertEqual(
+            exit_status,
+            audit_under_test.EXIT_REPORT_OUTPUT_FAILED,
+        )
+        self.assertIn("report publication failed", diagnostic_stream.getvalue())
+
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "directory read-permission fixture requires an unprivileged identity",
+    )
+    def test_write_search_only_report_parent_has_documented_output_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            audited_file = fixture_root / "audited"
+            audited_file.write_bytes(b"fixture")
+            report_directory = fixture_root / "write-search-only"
+            report_directory.mkdir(mode=0o300)
+            report_path = report_directory / "report.jsonl"
+            try:
+                completed_command = run_audit_tool_command(
+                    "--output",
+                    str(report_path),
+                    str(audited_file),
+                )
+            finally:
+                report_directory.chmod(0o700)
+
+        self.assertEqual(
+            completed_command.returncode,
+            audit_under_test.EXIT_REPORT_OUTPUT_FAILED,
+        )
+        self.assertIn(b"destination parent directory", completed_command.stderr)
 
     def test_new_report_is_private_unpublished_then_atomically_named(
         self,
@@ -3187,6 +3775,118 @@ class ReportPublicationVerificationTests(unittest.TestCase):
             self.assertEqual(
                 self.unpublished_report_paths(destination_directory),
                 [],
+            )
+
+    def test_exchange_directory_fsync_failure_restores_old_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination_directory = Path(temporary_directory)
+            destination_path = destination_directory / "report.jsonl"
+            destination_path.write_text("old\n", encoding="utf-8")
+            publication = self.create_report_publication(
+                destination_path,
+                replacement_is_authorized=True,
+            )
+
+            with (
+                self.assertRaises(audit_under_test.ReportPublicationError),
+                mock.patch.object(
+                    publication,
+                    "_synchronize_destination_directory",
+                    side_effect=OSError(errno.EIO, "simulated directory fsync failure"),
+                ),
+                publication,
+            ):
+                assert publication.text_stream is not None
+                publication.text_stream.write("new\n")
+
+            self.assertEqual(
+                destination_path.read_text(encoding="utf-8"),
+                "old\n",
+            )
+            self.assertFalse(publication.created_report_was_published_to_destination)
+            self.assertEqual(
+                self.unpublished_report_paths(destination_directory),
+                [],
+            )
+
+    def test_final_directory_fsync_failure_reports_partial_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination_directory = Path(temporary_directory)
+            destination_path = destination_directory / "report.jsonl"
+            destination_path.write_text("old\n", encoding="utf-8")
+            publication = self.create_report_publication(
+                destination_path,
+                replacement_is_authorized=True,
+            )
+            synchronize_normally = publication._synchronize_destination_directory
+            synchronization_count = 0
+
+            def fail_second_directory_synchronization():
+                nonlocal synchronization_count
+                synchronization_count += 1
+                if synchronization_count == 2:
+                    raise OSError(
+                        errno.EIO,
+                        "simulated final directory fsync failure",
+                    )
+                synchronize_normally()
+
+            with (
+                self.assertRaises(
+                    audit_under_test.ReportPublicationPartiallyCompletedError
+                ),
+                mock.patch.object(
+                    publication,
+                    "_synchronize_destination_directory",
+                    side_effect=fail_second_directory_synchronization,
+                ),
+                publication,
+            ):
+                assert publication.text_stream is not None
+                publication.text_stream.write("new\n")
+
+            self.assertEqual(synchronization_count, 2)
+            self.assertEqual(
+                destination_path.read_text(encoding="utf-8"),
+                "new\n",
+            )
+            self.assertTrue(publication.created_report_was_published_to_destination)
+            self.assertEqual(
+                self.unpublished_report_paths(destination_directory),
+                [],
+            )
+
+    def test_command_diagnostic_distinguishes_partial_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            audited_file = fixture_root / "audited"
+            audited_file.write_bytes(b"fixture")
+            destination_path = fixture_root / "report.jsonl"
+
+            with mock.patch.object(
+                audit_under_test.PrivateReportPublication,
+                "_synchronize_destination_directory",
+                side_effect=OSError(errno.EIO, "simulated directory fsync failure"),
+            ):
+                diagnostic_stream = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic_stream):
+                    exit_status = audit_under_test.run_audit_command(
+                        (
+                            "--allow-root-audit",
+                            "--output",
+                            str(destination_path),
+                            str(audited_file),
+                        )
+                    )
+
+            self.assertEqual(
+                exit_status,
+                audit_under_test.EXIT_REPORT_OUTPUT_FAILED,
+            )
+            self.assertTrue(destination_path.is_file())
+            self.assertIn(
+                "report publication partially completed",
+                diagnostic_stream.getvalue(),
             )
 
     def test_exception_removes_unpublished_report_and_preserves_destination(
@@ -3390,7 +4090,7 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 [],
             )
 
-    def test_active_report_artifacts_are_omitted_and_block_tree_deletion(
+    def test_active_report_artifacts_are_omitted_and_do_not_change_tree_deletion(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3432,15 +4132,63 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 for record in path_records
                 if record["audited_path"] == str(audited_directory)
             )
-            delete_reason_codes = {
-                reason["reason_code"]
-                for reason in audited_directory_record["model_blocked_capabilities"][
-                    audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
-                ]
-            }
             self.assertIn(
-                "at_least_one_descendant_would_remain",
-                delete_reason_codes,
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                audited_directory_record["model_indicated_capabilities"],
+            )
+
+    def test_report_inside_and_outside_tree_produce_same_root_delete_inference(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            roots = [fixture_root / "inside-case", fixture_root / "outside-case"]
+            for root in roots:
+                root.mkdir()
+                (root / "ordinary-child").write_bytes(b"ordinary")
+            inside_report = roots[0] / "report.jsonl"
+            outside_report = fixture_root / "outside-report.jsonl"
+
+            inside_command = run_audit_tool_command(
+                "--full-audit",
+                "--capability",
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                "--output",
+                str(inside_report),
+                str(roots[0]),
+            )
+            outside_command = run_audit_tool_command(
+                "--full-audit",
+                "--capability",
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                "--output",
+                str(outside_report),
+                str(roots[1]),
+            )
+
+            self.assertEqual(inside_command.returncode, 0, inside_command.stderr)
+            self.assertEqual(outside_command.returncode, 0, outside_command.stderr)
+
+            def root_delete_fields(report_path: Path, root_path: Path):
+                records = [
+                    json.loads(line)
+                    for line in report_path.read_text(encoding="utf-8").splitlines()
+                ]
+                record = next(
+                    item
+                    for item in records
+                    if item.get("audited_path") == str(root_path)
+                )
+                return (
+                    record["model_status"],
+                    record["model_indicated_capabilities"],
+                    record["model_blocked_capabilities"],
+                    record.get("capabilities_with_insufficient_evidence", {}),
+                )
+
+            self.assertEqual(
+                root_delete_fields(inside_report, roots[0]),
+                root_delete_fields(outside_report, roots[1]),
             )
 
 
