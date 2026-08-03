@@ -36,9 +36,11 @@ report is written to a mode-0600 O_EXCL temporary sibling and published with
 RENAME_NOREPLACE only after synchronization.  ``--replace-output`` permits an
 existing regular destination to be exchanged without immediate destruction;
 the displaced identity/change snapshot and published report identity are then
-validated, and a mismatch is exchanged back.  Hostile writers in a shared
-destination directory can still race validation and cleanup entry names, so
-report publication is not described as a general filesystem transaction.
+validated, and a mismatch is exchanged back.  Non-sticky destination
+directories writable by group or other users are refused because hostile
+writers could race validation and cleanup entry names.  Same-identity writers
+are not isolated by this process-identity trust boundary, so report publication
+is not described as a general filesystem transaction.
 """
 
 from __future__ import annotations
@@ -8011,6 +8013,22 @@ class PrivateReportPublication:
             if not stat.S_ISDIR(opened_directory_metadata.st_mode):
                 raise ReportPublicationError(
                     "report destination parent descriptor is not a directory"
+                )
+            shared_write_permission_bits = opened_directory_metadata.st_mode & (
+                stat.S_IWGRP | stat.S_IWOTH
+            )
+            if (
+                shared_write_permission_bits
+                and not (opened_directory_metadata.st_mode & stat.S_ISVTX)
+            ):
+                destination_directory_diagnostic = quote_path_for_diagnostic(
+                    self.destination_parent_directory_path
+                )
+                raise ReportPublicationError(
+                    "refusing non-sticky group/other-writable report "
+                    "destination directory "
+                    f"{destination_directory_diagnostic}; "
+                    "another user could replace a validated cleanup entry"
                 )
         except BaseException:
             with contextlib.suppress(OSError):
