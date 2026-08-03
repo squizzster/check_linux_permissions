@@ -3045,6 +3045,56 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 [],
             )
 
+    def test_non_sticky_shared_output_directory_is_refused_before_creation(
+        self,
+    ) -> None:
+        for shared_mode in (0o770, 0o707):
+            with (
+                self.subTest(shared_mode=oct(shared_mode)),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                destination_directory = Path(temporary_directory)
+                destination_directory.chmod(shared_mode)
+                destination_path = destination_directory / "report.jsonl"
+
+                with self.assertRaisesRegex(
+                    audit_under_test.ReportPublicationError,
+                    "non-sticky group/other-writable",
+                ):
+                    with self.create_report_publication(
+                        destination_path,
+                        replacement_is_authorized=False,
+                    ):
+                        self.fail("unsafe output directory must be refused")
+
+                self.assertFalse(destination_path.exists())
+                self.assertEqual(
+                    self.unpublished_report_paths(destination_directory),
+                    [],
+                )
+
+    def test_sticky_shared_output_directory_remains_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination_directory = Path(temporary_directory)
+            destination_directory.chmod(0o1777)
+            destination_path = destination_directory / "report.jsonl"
+
+            with self.create_report_publication(
+                destination_path,
+                replacement_is_authorized=False,
+            ) as publication:
+                assert publication.text_stream is not None
+                publication.text_stream.write("complete\n")
+
+            self.assertEqual(
+                destination_path.read_text(encoding="utf-8"),
+                "complete\n",
+            )
+            self.assertEqual(
+                self.unpublished_report_paths(destination_directory),
+                [],
+            )
+
     def test_existing_destination_requires_explicit_replacement(
         self,
     ) -> None:

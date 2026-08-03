@@ -498,7 +498,10 @@ An existing destination is refused unless `--replace-output` is supplied:
 
 Replacement is limited to a regular file and uses a synchronized temporary
 sibling plus atomic rename checks. Symlink and special-file destinations are
-refused.
+refused. Non-sticky destination directories writable by group or other users
+are also refused because another user could swap a checked temporary entry
+before cleanup. Sticky shared directories remain supported; processes running
+under the same user identity remain within the publication trust boundary.
 
 Writing the report file is the tool's deliberate filesystem-mutation exception.
 Use stdout when even report creation is not acceptable.
