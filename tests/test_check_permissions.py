@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -568,6 +569,269 @@ class AuditScopeDiscoveryEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(discovery.uncertainty_reasons, ())
         self.assertTrue(discovery.observed_at_utc.endswith("Z"))
+
+
+class SafeOptimizationVerificationTests(unittest.TestCase):
+    def test_strict_realpath_avoids_path_object_on_supported_python(self) -> None:
+        with (
+            mock.patch.object(
+                audit_under_test,
+                "_OS_PATH_REALPATH_SUPPORTS_STRICT",
+                True,
+            ),
+            mock.patch.object(
+                audit_under_test.os.path,
+                "realpath",
+                return_value="/resolved/path",
+            ) as realpath,
+        ):
+            resolved_path = audit_under_test.strictly_resolve_path("/input/path")
+
+        self.assertEqual(resolved_path, "/resolved/path")
+        realpath.assert_called_once_with("/input/path", strict=True)
+
+    def test_strict_realpath_retains_python_39_pathlib_fallback(self) -> None:
+        with (
+            mock.patch.object(
+                audit_under_test,
+                "_OS_PATH_REALPATH_SUPPORTS_STRICT",
+                False,
+            ),
+            mock.patch.object(
+                audit_under_test.Path,
+                "resolve",
+                return_value=audit_under_test.Path("/fallback/path"),
+            ) as pathlib_resolve,
+        ):
+            resolved_path = audit_under_test.strictly_resolve_path("/input/path")
+
+        self.assertEqual(resolved_path, "/fallback/path")
+        pathlib_resolve.assert_called_once_with(strict=True)
+
+    def test_ordinary_terminal_path_bypasses_character_encoder(self) -> None:
+        with mock.patch(
+            "builtins.ord",
+            side_effect=AssertionError("ordinary path used character encoder"),
+        ):
+            escaped_path = audit_under_test.escape_linux_path_text_for_terminal(
+                "/ordinary/printable-path_123"
+            )
+
+        self.assertEqual(escaped_path, "/ordinary/printable-path_123")
+        self.assertEqual(
+            audit_under_test.escape_linux_path_text_for_terminal(
+                'quote" backslash\\ newline\n byte\udcff delete\x7f'
+            ),
+            'quote\\" backslash\\\\ newline\\n byte\\xff delete\\u007f',
+        )
+
+    def test_parent_resolution_is_reused_only_within_one_assessment(self) -> None:
+        active_auditor = permission_auditor()
+
+        with mock.patch.object(
+            audit_under_test,
+            "strictly_resolve_path",
+            wraps=audit_under_test.strictly_resolve_path,
+        ) as strict_resolution:
+            first_assessment_cache = audit_under_test.PathAssessmentEvidenceCache()
+            active_auditor._lookup_mount_within_path_assessment(
+                "/tmp/nonexistent-audit-target",
+                follow_final_symbolic_link=False,
+                evidence_cache=first_assessment_cache,
+            )
+            active_auditor._lookup_mount_within_path_assessment(
+                "/tmp",
+                follow_final_symbolic_link=True,
+                evidence_cache=first_assessment_cache,
+            )
+            self.assertEqual(strict_resolution.call_count, 1)
+
+            active_auditor._lookup_mount_within_path_assessment(
+                "/tmp/nonexistent-audit-target",
+                follow_final_symbolic_link=False,
+                evidence_cache=audit_under_test.PathAssessmentEvidenceCache(),
+            )
+
+        self.assertEqual(strict_resolution.call_count, 2)
+
+    def test_reused_resolution_failure_keeps_context_specific_reason(self) -> None:
+        resolution_cache: dict[
+            str,
+            audit_under_test.StrictPathResolutionObservation,
+        ] = {}
+        denied_error = OSError(errno.EACCES, os.strerror(errno.EACCES), "/blocked")
+
+        with mock.patch.object(
+            audit_under_test,
+            "strictly_resolve_path",
+            side_effect=denied_error,
+        ) as strict_resolution:
+            _, parent_reason = (
+                audit_under_test.best_effort_resolve_parent_components_only(
+                    "/blocked/entry",
+                    resolution_cache=resolution_cache,
+                )
+            )
+            _, path_reason = audit_under_test.best_effort_resolve_existing_path(
+                "/blocked",
+                resolution_cache=resolution_cache,
+            )
+
+        strict_resolution.assert_called_once_with("/blocked")
+        self.assertIsNotNone(parent_reason)
+        self.assertIsNotNone(path_reason)
+        assert parent_reason is not None
+        assert path_reason is not None
+        self.assertEqual(
+            parent_reason.reason_code,
+            "cannot_resolve_parent_for_mountpoint_lookup",
+        )
+        self.assertEqual(
+            path_reason.reason_code,
+            "cannot_resolve_path_for_mount_lookup",
+        )
+        self.assertEqual(parent_reason.operating_system_errno, errno.EACCES)
+        self.assertEqual(path_reason.operating_system_errno, errno.EACCES)
+
+    def test_identical_evidence_is_reused_only_within_one_path_assessment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_file = Path(temporary_directory) / "audited-file"
+            audited_file.write_bytes(b"content")
+            audited_file_metadata = os.lstat(audited_file)
+            active_auditor = permission_auditor()
+
+            with (
+                mock.patch.object(
+                    active_auditor.mount_table,
+                    "lookup_mount_for_path",
+                    wraps=active_auditor.mount_table.lookup_mount_for_path,
+                ) as mount_lookup,
+                mock.patch.object(
+                    audit_under_test,
+                    "observe_linux_inode_attributes",
+                    wraps=audit_under_test.observe_linux_inode_attributes,
+                ) as inode_attribute_observation,
+                mock.patch.object(
+                    active_auditor,
+                    "ask_kernel_about_access",
+                    wraps=active_auditor.ask_kernel_about_access,
+                ) as access_observation,
+            ):
+                first_assessment = active_auditor.assess_non_directory_path(
+                    str(audited_file),
+                    audited_file_metadata,
+                    audit_under_test.FILESYSTEM_OBJECT_KIND_REGULAR_FILE,
+                    audit_under_test.DEFAULT_MUTATION_CAPABILITIES,
+                )
+
+                self.assertEqual(mount_lookup.call_count, 3)
+                self.assertEqual(inode_attribute_observation.call_count, 3)
+                self.assertEqual(access_observation.call_count, 2)
+                self.assertEqual(
+                    {
+                        first_assessment.inference_for_capability(
+                            capability_name
+                        ).model_verdict
+                        for capability_name in (
+                            audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                            audit_under_test.CAPABILITY_OVERWRITE_REGULAR_FILE_CONTENT,
+                        )
+                    },
+                    {audit_under_test.MODEL_VERDICT_INDICATES_ALLOWED},
+                )
+
+                active_auditor.assess_non_directory_path(
+                    str(audited_file),
+                    audited_file_metadata,
+                    audit_under_test.FILESYSTEM_OBJECT_KIND_REGULAR_FILE,
+                    audit_under_test.DEFAULT_MUTATION_CAPABILITIES,
+                )
+
+            self.assertEqual(mount_lookup.call_count, 6)
+            self.assertEqual(inode_attribute_observation.call_count, 6)
+            self.assertEqual(access_observation.call_count, 4)
+
+    def test_combined_write_search_denial_is_split_for_precise_reasons(
+        self,
+    ) -> None:
+        active_auditor = permission_auditor()
+        allowed = audit_under_test.KernelPathAccessEvidence(True, None)
+        blocked = audit_under_test.KernelPathAccessEvidence(False, None)
+
+        def access_evidence_for_mode(
+            _path: str,
+            requested_access_mode: int,
+        ) -> audit_under_test.KernelPathAccessEvidence:
+            return allowed if requested_access_mode == os.X_OK else blocked
+
+        with mock.patch.object(
+            active_auditor,
+            "ask_kernel_about_access",
+            side_effect=access_evidence_for_mode,
+        ) as access_observation:
+            write_access, search_access = (
+                active_auditor._ask_kernel_about_write_and_search_within_path_assessment(
+                    "/modeled-directory",
+                    evidence_cache=audit_under_test.PathAssessmentEvidenceCache(),
+                )
+            )
+
+        self.assertFalse(write_access.access_is_allowed)
+        self.assertTrue(search_access.access_is_allowed)
+        self.assertEqual(
+            access_observation.call_args_list,
+            [
+                mock.call("/modeled-directory", os.W_OK | os.X_OK),
+                mock.call("/modeled-directory", os.W_OK),
+                mock.call("/modeled-directory", os.X_OK),
+            ],
+        )
+
+    def test_lexical_mount_walk_does_not_renormalize_each_ancestor(self) -> None:
+        root_mount = mock.sentinel.root_mount
+        nested_mount = mock.sentinel.nested_mount
+        mount_table = object.__new__(audit_under_test.VisibleLinuxMountTable)
+        mount_table.visible_root_mount = root_mount
+        mount_table.visible_mount_by_mountpoint = {
+            "/": root_mount,
+            "/nested": nested_mount,
+        }
+
+        with mock.patch.object(
+            audit_under_test,
+            "lexically_normalize_absolute_path",
+            side_effect=AssertionError("hot mount walk renormalized an ancestor"),
+        ):
+            observed_mount = mount_table._visible_mount_for_lexical_path(
+                "/nested/one/two"
+            )
+
+        self.assertIs(observed_mount, nested_mount)
+
+    def test_nonmatching_assessment_is_filtered_before_record_allocation(
+        self,
+    ) -> None:
+        configuration = audit_under_test.parse_audit_command_line_arguments(("/scope",))
+        blocked_inference = audit_under_test.capability_inference(
+            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+            audit_under_test.MODEL_VERDICT_INDICATES_BLOCKED,
+        )
+        assessment = mock.Mock()
+        assessment.inference_for_capability.return_value = blocked_inference
+        permission_model = mock.Mock()
+        permission_model.assess_path_tree.return_value = iter((assessment,))
+
+        emitted_records = list(
+            audit_under_test.iterate_structured_path_audit_records(
+                configuration,
+                permission_model,
+            )
+        )
+
+        self.assertEqual(emitted_records, [])
+        assessment.create_structured_record.assert_not_called()
 
 
 class EvidenceUncertaintyVerificationTests(unittest.TestCase):
@@ -1153,7 +1417,7 @@ class LinuxMountEvidenceVerificationTests(unittest.TestCase):
         )
         self.assertEqual(
             uncertainty_reason.evidence_source,
-            "pathlib.Path.resolve(strict=True)",
+            audit_under_test.STRICT_PATH_RESOLUTION_EVIDENCE_SOURCE,
         )
 
     def test_malformed_mountinfo_degrades_to_named_uncertainty(self) -> None:
@@ -2162,3 +2426,96 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 "at_least_one_descendant_would_remain",
                 delete_reason_codes,
             )
+
+
+@unittest.skipUnless(shutil.which("strace"), "strace is unavailable")
+class StraceReadOnlySmokeTest(unittest.TestCase):
+    def test_stdout_mode_has_no_explicit_target_mutation_syscalls(self) -> None:
+        with tempfile.TemporaryDirectory() as target_directory:  # noqa: SIM117
+            with tempfile.TemporaryDirectory() as trace_directory:
+                target = Path(target_directory)
+                target_file = target / "fixture"
+                target_file.write_bytes(b"immutable test payload")
+                original_mode = stat.S_IMODE(target_file.stat().st_mode)
+                trace_path = Path(trace_directory) / "trace.log"
+
+                environment = os.environ.copy()
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
+                completed = subprocess.run(
+                    [
+                        "strace",
+                        "-qq",
+                        "-f",
+                        "-e",
+                        "trace=%file",
+                        "-o",
+                        str(trace_path),
+                        sys.executable,
+                        str(AUDIT_SCRIPT_PATH),
+                        "--allow-root-audit",
+                        "--include-nonmatching-records",
+                        "--json",
+                        str(target),
+                    ],
+                    capture_output=True,
+                    env=environment,
+                    timeout=30,
+                    check=False,
+                )
+                if completed.returncode != 0 and (
+                    b"Operation not permitted" in completed.stderr
+                    or b"ptrace" in completed.stderr
+                ):
+                    self.skipTest("ptrace is blocked in this environment")
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                mutating_syscall_names = (
+                    "creat(",
+                    "unlink(",
+                    "unlinkat(",
+                    "rename(",
+                    "renameat(",
+                    "renameat2(",
+                    "mkdir(",
+                    "mkdirat(",
+                    "rmdir(",
+                    "chmod(",
+                    "fchmodat(",
+                    "chown(",
+                    "lchown(",
+                    "truncate(",
+                )
+                mutating_open_flags = (
+                    "O_WRONLY",
+                    "O_RDWR",
+                    "O_CREAT",
+                    "O_TRUNC",
+                    "O_APPEND",
+                )
+                relevant_lines = [
+                    line
+                    for line in trace_path.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    ).splitlines()
+                    if target_directory in line
+                ]
+                for line in relevant_lines:
+                    self.assertFalse(
+                        any(name in line for name in mutating_syscall_names),
+                        line,
+                    )
+                    self.assertFalse(
+                        any(flag in line for flag in mutating_open_flags),
+                        line,
+                    )
+
+                self.assertEqual(target_file.read_bytes(), b"immutable test payload")
+                self.assertEqual(
+                    stat.S_IMODE(target_file.stat().st_mode),
+                    original_mode,
+                )
+                self.assertEqual(
+                    sorted(path.name for path in target.iterdir()),
+                    ["fixture"],
+                )

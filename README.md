@@ -1,125 +1,183 @@
-# check_permissions.py
+# Linux filesystem permission auditor
 
-`check_permissions.py` is a best-effort **Linux filesystem mutation capability auditor**. 
+`check_permissions.py` is a standalone, best-effort Linux filesystem mutation
+permission auditor for the current process identity. It models whether that
+identity could delete entries, append or overwrite regular-file content,
+create directory entries, or satisfy permission-layer checks for special-file
+writes.
 
-It models the permissions that usually decide whether the current process context could mutate filesystem state. The tool does not open files for writing, does not create files, and does not remove anything. It is designed for security reviews, host hardening checks, and detecting permission drift over time.
+The auditor observes metadata, effective credentials, mount state, sticky-bit
+rules, kernel access decisions, and immutable, append-only, and verity inode
+attributes. It does not execute the modeled mutations.
 
-Three things matter here:
-* **Does no harm:** Uses metadata, mountinfo, `statx`, and access checks.
-* **Changes nothing:** Never modifies file contents, size, atime, mtime, or ctime.
-* **Detects drift:** Highlights paths where broad permissions exist outside expected boundaries.
+Requirements: Linux and Python 3.9 or newer. The tool uses only the Python
+standard library.
 
----
+## Quick start
 
-## Capabilities Analyzed
-
-The tool treats "write" not as a single primitive, but as distinct mutation capabilities. When using the default `--format paths`, these capabilities are prefixed to the output using compact labels.
-
-| Label | Capability | Description |
-| :--- | :--- | :--- |
-| `[d]` | Delete | Delete an existing path, or recursively remove a directory tree. |
-| `[a]` | Append | Append to an existing regular file. |
-| `[o]` | Overwrite | Overwrite or truncate an existing regular file. |
-| `[c]` | Create | Create a child entry in an existing directory, or create an explicit missing path whose parent permits creation. |
-| `[s]` | Special Write | Write permission on a special file/device node. (Opt-in only for the default audit). |
-
----
-
-## Execution Modes
-
-You can tailor the tool to look for specific types of filesystem mutation vulnerabilities.
-
-| Flag | Emitted Status | Purpose |
-| :--- | :--- | :--- |
-| `--can-mutate` | `WOULD_MUTATE` | **Default.** Shows paths with delete, append, overwrite, or create capability. |
-| `--can-delete-only` | `WOULD_DELETE` | `rm -rf` simulator. Shows only paths that would likely be removable. |
-| `--can-append-only` | `WOULD_APPEND` | Shows existing regular files appendable by the process context. |
-| `--can-overwrite-only` | `WOULD_OVERWRITE` | Shows existing regular files overwritable/truncatable by the process context. |
-| `--can-content-write-only` | `WOULD_CONTENT_WRITE` | Shows existing regular files that are appendable or overwritable. |
-| `--can-create-only` | `WOULD_CREATE` | Shows directories, symlinked directories, and explicit missing paths where creation is possible. |
-| `--can-special-write-only` | `WOULD_SPECIAL_WRITE` | Shows writable special files/device nodes. |
-| `--can-write-only` | `WOULD_WRITE` | Broad write audit: append, overwrite, create. |
-
----
-
-## Default Behavior and Auto-Exclusions
-
-By default, executing the tool with no arguments behaves as a general security audit:
+Run the executable as the identity whose permissions matter:
 
 ```bash
-python check_permissions.py
+./check_permissions.py /explicit/path
 ```
 
-* **Target:** Scans `/` recursively.
-* **Auto-skips:** `/proc` and the active writable temp directory (e.g., `TMPDIR`, `/tmp`) are skipped to reduce noisy, expected output.
-* **Suppresses:** Paths lexically under discovered home directories are hidden from the final output.
-* **Special Files:** Ignored by default to avoid noisy `/dev` output.
+When standard output is a terminal, results use compact human-readable lines.
+Redirected output is self-contained JSON Lines:
 
-To perform a totally unrestricted audit encompassing all default-suppressed areas and special-write checks, use the `--include-all` (or `--all`) flag.
-
----
-
-## Important Model Choices
-
-* **Symlinks:** Deletion is checked on the symlink itself. Content and creation checks follow the symlink, because `open("link", O_WRONLY)` normally writes to the target. Dangling symlinks are evaluated for "create-through-symlink" risk.
-* **Directory "Write":** Reported as a `create` capability (requires write + search on the directory, a writable mount, and no immutable flag).
-* **Append-Only Inodes:** Regular-file appendability is accurately reported even when overwrite/truncate would be blocked by the Linux append-only inode flag (via `statx`).
-* **Reality Constraints:** This is a simulator. MAC policy (SELinux/AppArmor), idmapped mounts, network/FUSE semantics, or live race conditions can still make real-world operations differ.
-
----
-
-## Output Formats
-
-Control output structuring via the `--format` argument:
-
-| Format | Description |
-| :--- | :--- |
-| `paths` | **Default.** Compact output displaying the file path, optionally prefixed with capability labels (e.g., `[dao] /etc/config`). |
-| `jsonl` | One structured JSON object per line. Ideal for passing into `jq` or SIEM ingestion. |
-| `tsv` | Tab-separated values including status, mode, capabilities, and explicit block/skip reasons. |
-
-*Note: By default, only passing results are printed. Use `--all-results` to view paths that returned `WOULD_FAIL`, `UNKNOWN`, or `SKIP`.*
-
----
-
-## Common Usage Examples
-
-**Run the default audit as nobody:**
 ```bash
-setpriv --reuid nobody --regid nogroup --clear-groups -- python check_permissions.py
+./check_permissions.py /srv/project
+./check_permissions.py --json /srv/project > permissions.jsonl
+./check_permissions.py --human /srv/project | less
 ```
 
-**Find exactly what can be deleted in a specific directory:**
+Effective UID 0 is refused unless the audit is explicitly authorized:
+
 ```bash
-python check_permissions.py --can-delete-only /var/tmp/project
+sudo ./check_permissions.py --allow-root-audit /srv/project
 ```
 
-**Find existing configuration files that can be tampered with:**
+Use `--help` for the complete evidence boundary, default-scan behavior, and
+option reference.
+
+## Capabilities
+
+By default the auditor evaluates these four mutation capabilities:
+
+| Label | Capability | Meaning |
+|---|---|---|
+| `d` | `delete_entry_or_tree` | Remove an entry without following its final symlink, or remove an assessed directory tree. |
+| `a` | `append_regular_file_content` | Append to an existing regular file, including through a symlink. |
+| `o` | `overwrite_regular_file_content` | Modify or truncate regular-file content outside append-only constraints. |
+| `c` | `create_directory_entry` | Create a child in an existing directory or an explicitly requested missing final path. |
+| `s` | `special_file_write_permission` | Satisfy permission-layer checks for a FIFO, socket, character device, or block device without exercising it. |
+
+Select capabilities by repeating `--capability`:
+
 ```bash
-python check_permissions.py --can-content-write-only /etc /usr/bin
+./check_permissions.py \
+  --capability delete_entry_or_tree \
+  --capability overwrite_regular_file_content \
+  /etc /opt
 ```
 
-**Structured report of overwritable files, saving to disk:**
+Only paths with at least one model-allowed selected capability are emitted by
+default. Add `--include-nonmatching-records` with JSON output to inspect
+blocked, uncertain, and skipped conclusions.
+
+## Scope and exclusions
+
+With no path argument, the auditor scans `/`. The default root scan excludes
+`/proc` and the first active writable temporary directory and does not traverse
+discovered process-related home directories. These default exclusions do not
+apply to explicitly supplied roots.
+
+Prefer explicit roots for bounded, interpretable audits:
+
 ```bash
-python check_permissions.py --can-overwrite-only --format jsonl --output risk_report.jsonl /opt
+./check_permissions.py --stay-on-starting-filesystem /srv/application
+./check_permissions.py --exclude /srv/application/cache /srv/application
 ```
 
-**Include special files and temp directories in the audit:**
+The include switches shown by `--help` can opt default scans back into home,
+temporary-directory, or `/proc` traversal.
+
+## Structured evidence
+
+Each JSONL path record carries the complete run and source provenance needed
+when records are moved independently, including:
+
+- tool version and observed source digest;
+- process credentials and effective capabilities;
+- mount-table identity and uncertainty;
+- capability-model and record-schema identifiers;
+- allowed, blocked, uncertain, and skipped inference evidence;
+- the model boundaries that can disagree with a future real syscall.
+
+The v3 implementation retains the `/v2` capability-model and record-schema
+identifiers because it optimizes the same model and record shape. Tool name,
+tool version `3.0.0`, source digest, and run provenance identify the new
+implementation.
+
+## Read and write boundaries
+
+Audited paths are never intentionally opened for writing, created, removed,
+renamed, chmodded, chowned, or assigned inode flags. Directory listing requests
+Linux `O_NOATIME`; a clearly reported fallback read may update access time.
+Reads can also trigger automount, network, FUSE, device, or filesystem-specific
+effects. Use a snapshot or read-only mount when forensic non-interference is
+required.
+
+`--output FILE` is the deliberate mutation exception. It privately writes and
+synchronizes a new report before publishing it without replacing an existing
+entry. `--replace-output` explicitly authorizes guarded replacement of an
+existing regular report. Symlink and special-file destinations are refused.
+Use stdout when report publication itself must not mutate the filesystem.
+
+## v3 performance
+
+Safe optimization work retained every permission check, mount constraint,
+inode-attribute observation, uncertainty rule, and provenance field. On the
+development host:
+
+| Audit | v2 | v3 | Improvement |
+|---|---:|---:|---:|
+| 862-entry project tree | 0.51-0.52 s | 0.22 s | about 57% faster |
+| `/usr/include` | 9.07 s | 3.60 s | about 60% faster |
+
+The project-tree syscall profile used 70% fewer `lstat`, 24% fewer `statx`, and
+50% fewer `faccessat2` calls. Compact output matched v2 byte-for-byte, and
+modeled JSON evidence matched after removing only timestamps, run/process
+identity, and implementation source provenance.
+
+The optimizations are deliberately assessment-local. Evidence is not cached
+across separate paths, where live-filesystem staleness would weaken integrity.
+
+## Migration from the legacy CLI
+
+The old implementation remains available through Git history. Common option
+replacements are:
+
+| Legacy option | Current option |
+|---|---|
+| `--run-as-root` | `--allow-root-audit` |
+| `--format paths` | `--human`, or automatic terminal output |
+| `--format jsonl` | `--json`, or automatic redirected output |
+| `--one-file-system` | `--stay-on-starting-filesystem` |
+| `--force-output` | `--replace-output` |
+| `--all-results` | `--include-nonmatching-records` |
+| `--can-*-only` modes | one or more `--capability NAME` options |
+
+## Tests
+
+Run the standard-library suite:
+
 ```bash
-python check_permissions.py --include-special-write --include-tmp /
+python3 -m unittest discover -s tests -v
 ```
 
-**Only print vulnerable directories, excluding specific subtrees:**
-```bash
-python check_permissions.py --directories-only --exclude /var/cache /srv
-```
+The suite covers controlled permissions and path kinds, every capability,
+mount topology, symlinks and loops, sticky directories, inode attributes,
+arbitrary Linux filename bytes, depth-safe traversal, report publication and
+rollback, output contracts, explicit uncertainty, optimization cache
+boundaries, and provenance. When `strace` is installed, a stdout-mode smoke
+test rejects target-mutating syscalls and mutating open flags.
 
----
+CI runs the suite on Linux against Python 3.9 and a current Python release.
 
-## Operational Guidance
+## Exit status
 
-**No output is generally good. Some output is not automatically bad.**
+- `0`: audit and output completed
+- `2`: command-line or root-execution refusal
+- `3`: report destination or output failure
+- `4`: unexpected audit runtime failure
+- `130`: interrupted
 
-A non-empty result can be legitimate depending on how the system is administered, local service accounts, or container layouts. Treat the output as a **security signal for review**, not an immediate declaration of compromise. 
+Broken stdout pipes exit successfully for pipelines such as `... | head`.
 
-If you are running the script as `root`, execution will be blocked unless you explicitly pass `--run-as-root`. Running as an unrestricted root user usually just reports root's power rather than ordinary-user risk. Use this flag only if you are explicitly auditing a restricted capability bounding set or rootless container.
+## Model boundaries
+
+This is evidence-backed modeling, not proof that a future mutation syscall will
+succeed. Live races, MAC/LSM and seccomp decisions, ACL/idmapped-mount details,
+leases, quotas, resource limits, remote filesystems, and special endpoint
+behavior can disagree with the model. The auditor preserves explicit
+uncertainty instead of converting unavailable evidence into permission.

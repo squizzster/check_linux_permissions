@@ -54,10 +54,17 @@ from types import TracebackType
 from typing import TextIO, TypeVar, Union
 
 AUDIT_TOOL_NAME = "check_permissions.py"
-AUDIT_TOOL_VERSION = "2.0.0"
+AUDIT_TOOL_VERSION = "3.0.0"
 CAPABILITY_MODEL_ID = "linux-filesystem-mutation-permission-model/v2"
 STRUCTURED_RECORD_SCHEMA_ID = "linux-filesystem-permission-audit-record/v2"
 AUDIT_RUN_PROVENANCE_SCHEMA_ID = "linux-filesystem-permission-audit-run-provenance/v2"
+
+_OS_PATH_REALPATH_SUPPORTS_STRICT = sys.version_info >= (3, 10)
+STRICT_PATH_RESOLUTION_EVIDENCE_SOURCE = (
+    "os.path.realpath(strict=True)"
+    if _OS_PATH_REALPATH_SUPPORTS_STRICT
+    else "pathlib.Path.resolve(strict=True)"
+)
 
 EXIT_AUDIT_COMPLETED = 0
 EXIT_COMMAND_LINE_REFUSED = 2
@@ -1011,65 +1018,135 @@ def lexically_normalize_absolute_path(path: str) -> str:
     )
 
 
-def best_effort_resolve_existing_path(
-    lexically_normalized_path: str,
-) -> tuple[str, EvidenceReason | None]:
+@dataclass(frozen=True)
+class StrictPathResolutionObservation:
+    """Context-neutral result of one strict pathname resolution attempt."""
+
+    resolved_path: str | None
+    failure_kind: str | None = None
+    operating_system_errno: int | None = None
+    operating_system_message: str | None = None
+    runtime_error_detail: str | None = None
+
+
+def observe_strict_path_resolution(
+    path: str,
+    *,
+    resolution_cache: dict[str, StrictPathResolutionObservation] | None = None,
+) -> StrictPathResolutionObservation:
+    """Observe strict resolution, optionally reusing it within one assessment."""
+    if resolution_cache is not None:
+        cached_observation = resolution_cache.get(path)
+        if cached_observation is not None:
+            return cached_observation
+
     try:
-        resolved_path = str(Path(lexically_normalized_path).resolve(strict=True))
+        observation = StrictPathResolutionObservation(
+            resolved_path=strictly_resolve_path(path)
+        )
     except OSError as error:
-        return (
-            lexically_normalized_path,
-            operating_system_error_reason(
-                "cannot_resolve_path_for_mount_lookup",
-                error,
-                evidence_source="pathlib.Path.resolve(strict=True)",
-            ),
+        observation = StrictPathResolutionObservation(
+            resolved_path=None,
+            failure_kind="operating_system_error",
+            operating_system_errno=error.errno,
+            operating_system_message=error.strerror or str(error),
         )
     except RuntimeError as error:
-        return (
-            lexically_normalized_path,
-            EvidenceReason(
-                "cannot_resolve_path_for_mount_lookup",
-                evidence_source="pathlib.Path.resolve(strict=True)",
-                detail=str(error),
-            ),
+        observation = StrictPathResolutionObservation(
+            resolved_path=None,
+            failure_kind="runtime_error",
+            runtime_error_detail=str(error),
         )
-    return lexically_normalize_absolute_path(resolved_path), None
+
+    if resolution_cache is not None:
+        resolution_cache[path] = observation
+    return observation
+
+
+def strict_path_resolution_failure_reason(
+    reason_code: str,
+    observation: StrictPathResolutionObservation,
+) -> EvidenceReason | None:
+    """Give a shared raw resolution failure its caller-specific meaning."""
+    if observation.failure_kind == "operating_system_error":
+        return EvidenceReason(
+            reason_code,
+            evidence_source=STRICT_PATH_RESOLUTION_EVIDENCE_SOURCE,
+            operating_system_errno=observation.operating_system_errno,
+            operating_system_message=observation.operating_system_message,
+        )
+    if observation.failure_kind == "runtime_error":
+        return EvidenceReason(
+            reason_code,
+            evidence_source=STRICT_PATH_RESOLUTION_EVIDENCE_SOURCE,
+            detail=observation.runtime_error_detail,
+        )
+    return None
+
+
+def best_effort_resolve_existing_path(
+    lexically_normalized_path: str,
+    *,
+    resolution_cache: dict[str, StrictPathResolutionObservation] | None = None,
+) -> tuple[str, EvidenceReason | None]:
+    observation = observe_strict_path_resolution(
+        lexically_normalized_path,
+        resolution_cache=resolution_cache,
+    )
+    uncertainty_reason = strict_path_resolution_failure_reason(
+        "cannot_resolve_path_for_mount_lookup",
+        observation,
+    )
+    if uncertainty_reason is not None:
+        return lexically_normalized_path, uncertainty_reason
+    if observation.resolved_path is None:
+        raise RuntimeError("strict path resolution returned no result or failure")
+    return lexically_normalize_absolute_path(observation.resolved_path), None
+
+
+def strictly_resolve_path(path: str) -> str:
+    """Resolve one existing path without constructing an intermediate Path."""
+    if not _OS_PATH_REALPATH_SUPPORTS_STRICT:
+        return str(Path(path).resolve(strict=True))
+
+    try:
+        return os.path.realpath(path, strict=True)
+    except OSError as error:
+        # pathlib.Path.resolve translates ELOOP into RuntimeError.  Preserve
+        # that established evidence shape while avoiding Path construction on
+        # runtimes whose realpath already supports strict resolution.
+        if error.errno == errno.ELOOP:
+            raise RuntimeError(f"Symlink loop from {error.filename!r}") from error
+        raise
 
 
 def best_effort_resolve_parent_components_only(
     lexically_normalized_path: str,
+    *,
+    resolution_cache: dict[str, StrictPathResolutionObservation] | None = None,
 ) -> tuple[str, EvidenceReason | None]:
     """Resolve deletion-path parents while retaining the final entry itself."""
     parent_path = lexically_normalize_absolute_path(
         os.path.dirname(lexically_normalized_path) or "/"
     )
     final_component = os.path.basename(lexically_normalized_path)
-    try:
-        resolved_parent_path = str(Path(parent_path).resolve(strict=True))
-    except OSError as error:
-        return (
-            lexically_normalized_path,
-            operating_system_error_reason(
-                "cannot_resolve_parent_for_mountpoint_lookup",
-                error,
-                evidence_source="pathlib.Path.resolve(strict=True)",
-            ),
-        )
-    except RuntimeError as error:
-        return (
-            lexically_normalized_path,
-            EvidenceReason(
-                "cannot_resolve_parent_for_mountpoint_lookup",
-                evidence_source="pathlib.Path.resolve(strict=True)",
-                detail=str(error),
-            ),
-        )
+    observation = observe_strict_path_resolution(
+        parent_path,
+        resolution_cache=resolution_cache,
+    )
+    uncertainty_reason = strict_path_resolution_failure_reason(
+        "cannot_resolve_parent_for_mountpoint_lookup",
+        observation,
+    )
+    if uncertainty_reason is not None:
+        return lexically_normalized_path, uncertainty_reason
+    if observation.resolved_path is None:
+        raise RuntimeError("strict parent resolution returned no result or failure")
     if lexically_normalized_path == "/":
         return "/", None
     return (
         lexically_normalize_absolute_path(
-            os.path.join(resolved_parent_path, final_component)
+            os.path.join(observation.resolved_path, final_component)
         ),
         None,
     )
@@ -1871,24 +1948,32 @@ class VisibleLinuxMountTable:
                 return matching_mount_record
             if current_ancestor_path == "/":
                 return self.visible_root_mount
-            current_ancestor_path = lexically_normalize_absolute_path(
-                os.path.dirname(current_ancestor_path) or "/"
-            )
+            # The input and every derived ancestor are already normalized
+            # absolute Linux paths.  Re-running abspath/normpath for every
+            # component is pure duplicate work on this hot path.
+            current_ancestor_path = current_ancestor_path.rsplit("/", 1)[0] or "/"
 
     def lookup_mount_for_path(
         self,
         path: str,
         *,
         follow_final_symbolic_link: bool = True,
+        strict_path_resolution_cache: (
+            dict[str, StrictPathResolutionObservation] | None
+        ) = None,
     ) -> MountLookupEvidence:
         lexically_normalized_path = lexically_normalize_absolute_path(path)
         if follow_final_symbolic_link:
             resolved_path, resolution_uncertainty = best_effort_resolve_existing_path(
-                lexically_normalized_path
+                lexically_normalized_path,
+                resolution_cache=strict_path_resolution_cache,
             )
         else:
             resolved_path, resolution_uncertainty = (
-                best_effort_resolve_parent_components_only(lexically_normalized_path)
+                best_effort_resolve_parent_components_only(
+                    lexically_normalized_path,
+                    resolution_cache=strict_path_resolution_cache,
+                )
             )
         lookup_uncertainties = list(self.uncertainty_reasons)
         if resolution_uncertainty is not None:
@@ -2274,6 +2359,33 @@ class DirectoryListingEvidence:
     opened_directory_identity_matched_lstat: bool | None = None
 
 
+@dataclass
+class PathAssessmentEvidenceCache:
+    """Reuse identical observations only within one path assessment.
+
+    The cache deliberately does not outlive an assessment.  This removes
+    duplicate capability checks while avoiding a run-wide view that could
+    silently retain stale pathname or permission evidence on a live system.
+    """
+
+    mount_lookup_by_path_and_follow_mode: dict[
+        tuple[str, bool],
+        MountLookupEvidence,
+    ] = field(default_factory=dict)
+    strict_path_resolution_by_path: dict[
+        str,
+        StrictPathResolutionObservation,
+    ] = field(default_factory=dict)
+    inode_attributes_by_path_and_follow_mode: dict[
+        tuple[str, bool],
+        LinuxInodeAttributeEvidence,
+    ] = field(default_factory=dict)
+    kernel_access_by_path_and_mode: dict[
+        tuple[str, int],
+        KernelPathAccessEvidence,
+    ] = field(default_factory=dict)
+
+
 class LinuxFilesystemMutationPermissionAuditor:
     """Best-effort Linux permission model with explicit evidence boundaries."""
 
@@ -2307,6 +2419,125 @@ class LinuxFilesystemMutationPermissionAuditor:
             path,
             requested_access_mode,
             process_credentials=self.process_credentials,
+        )
+
+    def _lookup_mount_within_path_assessment(
+        self,
+        path: str,
+        *,
+        follow_final_symbolic_link: bool,
+        evidence_cache: PathAssessmentEvidenceCache | None,
+    ) -> MountLookupEvidence:
+        if evidence_cache is None:
+            return self.mount_table.lookup_mount_for_path(
+                path,
+                follow_final_symbolic_link=follow_final_symbolic_link,
+            )
+        cache_key = (path, follow_final_symbolic_link)
+        cached_evidence = evidence_cache.mount_lookup_by_path_and_follow_mode.get(
+            cache_key
+        )
+        if cached_evidence is None:
+            cached_evidence = self.mount_table.lookup_mount_for_path(
+                path,
+                follow_final_symbolic_link=follow_final_symbolic_link,
+                strict_path_resolution_cache=(
+                    evidence_cache.strict_path_resolution_by_path
+                ),
+            )
+            evidence_cache.mount_lookup_by_path_and_follow_mode[cache_key] = (
+                cached_evidence
+            )
+        return cached_evidence
+
+    @staticmethod
+    def _observe_inode_attributes_within_path_assessment(
+        path: str,
+        *,
+        follow_final_symbolic_link: bool,
+        evidence_cache: PathAssessmentEvidenceCache | None,
+    ) -> LinuxInodeAttributeEvidence:
+        if evidence_cache is None:
+            return observe_linux_inode_attributes(
+                path,
+                follow_final_symbolic_link=follow_final_symbolic_link,
+            )
+        cache_key = (path, follow_final_symbolic_link)
+        cached_evidence = evidence_cache.inode_attributes_by_path_and_follow_mode.get(
+            cache_key
+        )
+        if cached_evidence is None:
+            cached_evidence = observe_linux_inode_attributes(
+                path,
+                follow_final_symbolic_link=follow_final_symbolic_link,
+            )
+            evidence_cache.inode_attributes_by_path_and_follow_mode[cache_key] = (
+                cached_evidence
+            )
+        return cached_evidence
+
+    def _ask_kernel_about_access_within_path_assessment(
+        self,
+        path: str,
+        requested_access_mode: int,
+        *,
+        evidence_cache: PathAssessmentEvidenceCache | None,
+    ) -> KernelPathAccessEvidence:
+        if evidence_cache is None:
+            return self.ask_kernel_about_access(path, requested_access_mode)
+        cache_key = (path, requested_access_mode)
+        cached_evidence = evidence_cache.kernel_access_by_path_and_mode.get(cache_key)
+        if cached_evidence is None:
+            cached_evidence = self.ask_kernel_about_access(
+                path,
+                requested_access_mode,
+            )
+            evidence_cache.kernel_access_by_path_and_mode[cache_key] = cached_evidence
+        return cached_evidence
+
+    def _ask_kernel_about_write_and_search_within_path_assessment(
+        self,
+        path: str,
+        *,
+        evidence_cache: PathAssessmentEvidenceCache | None,
+    ) -> tuple[KernelPathAccessEvidence, KernelPathAccessEvidence]:
+        """Prove both permissions together, splitting only when necessary."""
+        combined_access = self._ask_kernel_about_access_within_path_assessment(
+            path,
+            os.W_OK | os.X_OK,
+            evidence_cache=evidence_cache,
+        )
+        if combined_access.access_is_allowed is True:
+            individually_allowed = KernelPathAccessEvidence(
+                access_is_allowed=True,
+                uncertainty_reason=None,
+            )
+            if evidence_cache is not None:
+                evidence_cache.kernel_access_by_path_and_mode.setdefault(
+                    (path, os.W_OK),
+                    individually_allowed,
+                )
+                evidence_cache.kernel_access_by_path_and_mode.setdefault(
+                    (path, os.X_OK),
+                    individually_allowed,
+                )
+            return individually_allowed, individually_allowed
+
+        # A combined denial does not identify which bit failed.  Separate
+        # questions preserve the existing precise reason codes.  Retrying
+        # separately after an uncertain combined query likewise avoids
+        # broadening one transient failure into two unsupported conclusions.
+        return (
+            self._ask_kernel_about_access_within_path_assessment(
+                path,
+                os.W_OK,
+                evidence_cache=evidence_cache,
+            ),
+            self._ask_kernel_about_access_within_path_assessment(
+                path,
+                os.X_OK,
+                evidence_cache=evidence_cache,
+            ),
         )
 
     def assess_path_tree(
@@ -2857,6 +3088,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                 selected_capabilities,
             )
 
+        evidence_cache = PathAssessmentEvidenceCache()
         inference_by_capability_name: dict[str, CapabilityModelInference] = {}
         for capability_name in selected_capabilities:
             if capability_name == CAPABILITY_DELETE_ENTRY_OR_TREE:
@@ -2867,6 +3099,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         has_uncertain_descendant_delete=False,
                         has_blocked_descendant_delete=False,
                         directory_listing_failure=None,
+                        evidence_cache=evidence_cache,
                     )
                 )
             elif capability_name == CAPABILITY_APPEND_REGULAR_FILE_CONTENT:
@@ -2875,6 +3108,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         path,
                         filesystem_object_kind,
                         CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                        evidence_cache=evidence_cache,
                     )
                 )
             elif capability_name == CAPABILITY_OVERWRITE_REGULAR_FILE_CONTENT:
@@ -2883,6 +3117,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         path,
                         filesystem_object_kind,
                         CAPABILITY_OVERWRITE_REGULAR_FILE_CONTENT,
+                        evidence_cache=evidence_cache,
                     )
                 )
             elif capability_name == CAPABILITY_CREATE_DIRECTORY_ENTRY:
@@ -2902,6 +3137,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                     self.infer_special_file_write_permission(
                         path,
                         filesystem_object_kind,
+                        evidence_cache=evidence_cache,
                     )
                 )
 
@@ -2920,6 +3156,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         symbolic_link_metadata: os.stat_result,
         selected_capabilities: Sequence[str],
     ) -> PathCapabilityAssessment:
+        evidence_cache = PathAssessmentEvidenceCache()
         inference_by_capability_name: dict[str, CapabilityModelInference] = {}
         resolved_target_path: str | None = None
         target_path_resolution_note: EvidenceReason | None = None
@@ -2957,6 +3194,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         has_uncertain_descendant_delete=False,
                         has_blocked_descendant_delete=False,
                         directory_listing_failure=None,
+                        evidence_cache=evidence_cache,
                     )
                 )
                 continue
@@ -2986,6 +3224,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                                 symbolic_link_path,
                                 FILESYSTEM_OBJECT_KIND_REGULAR_FILE,
                                 CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                                evidence_cache=evidence_cache,
                             ),
                             (
                                 EvidenceReason(
@@ -3017,6 +3256,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                                 symbolic_link_path,
                                 FILESYSTEM_OBJECT_KIND_REGULAR_FILE,
                                 CAPABILITY_OVERWRITE_REGULAR_FILE_CONTENT,
+                                evidence_cache=evidence_cache,
                             ),
                             (
                                 EvidenceReason(
@@ -3050,6 +3290,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                             self.infer_create_child_in_directory(
                                 symbolic_link_path,
                                 target_metadata,
+                                evidence_cache=evidence_cache,
                             ),
                             (
                                 EvidenceReason(
@@ -3096,6 +3337,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                             self.infer_special_file_write_permission(
                                 symbolic_link_path,
                                 target_kind,
+                                evidence_cache=evidence_cache,
                             ),
                             (
                                 EvidenceReason(
@@ -3232,6 +3474,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                 ),
             )
 
+        evidence_cache = PathAssessmentEvidenceCache()
         inference_by_capability_name: dict[str, CapabilityModelInference] = {}
         for capability_name in selected_capabilities:
             if capability_name == CAPABILITY_DELETE_ENTRY_OR_TREE:
@@ -3244,6 +3487,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         ),
                         has_blocked_descendant_delete=(has_blocked_descendant_delete),
                         directory_listing_failure=directory_listing_failure,
+                        evidence_cache=evidence_cache,
                     )
                 )
             elif capability_name == CAPABILITY_CREATE_DIRECTORY_ENTRY:
@@ -3251,6 +3495,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                     self.infer_create_child_in_directory(
                         directory_path,
                         directory_metadata,
+                        evidence_cache=evidence_cache,
                     )
                 )
             elif capability_name in {
@@ -3301,6 +3546,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         has_uncertain_descendant_delete: bool,
         has_blocked_descendant_delete: bool,
         directory_listing_failure: EvidenceReason | None,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> CapabilityModelInference:
         evidence_reasons: list[EvidenceReason] = []
         model_has_uncertain_evidence = False
@@ -3317,9 +3563,12 @@ class LinuxFilesystemMutationPermissionAuditor:
             )
             model_has_uncertain_evidence = True
 
-        target_attribute_evidence = observe_linux_inode_attributes(
-            path,
-            follow_final_symbolic_link=False,
+        target_attribute_evidence = (
+            self._observe_inode_attributes_within_path_assessment(
+                path,
+                follow_final_symbolic_link=False,
+                evidence_cache=evidence_cache,
+            )
         )
         if target_attribute_evidence.immutable_attribute_is_set is True:
             evidence_reasons.append(
@@ -3341,10 +3590,20 @@ class LinuxFilesystemMutationPermissionAuditor:
             evidence_reasons.extend(target_attribute_evidence.uncertainty_reasons)
             model_has_uncertain_evidence = True
 
-        (
-            path_is_mountpoint,
-            mountpoint_uncertainties,
-        ) = self.mount_table.observe_path_is_visible_mountpoint(path)
+        mountpoint_lookup = self._lookup_mount_within_path_assessment(
+            path,
+            follow_final_symbolic_link=False,
+            evidence_cache=evidence_cache,
+        )
+        mountpoint_uncertainties = mountpoint_lookup.uncertainty_reasons
+        path_is_mountpoint = (
+            None
+            if mountpoint_uncertainties
+            else (
+                mountpoint_lookup.resolved_path_used_for_lookup
+                in self.mount_table.visible_mount_by_mountpoint
+            )
+        )
         if path_is_mountpoint is True:
             evidence_reasons.append(
                 EvidenceReason(
@@ -3363,7 +3622,10 @@ class LinuxFilesystemMutationPermissionAuditor:
         (
             filesystem_uncertainty_reasons,
             filesystem_semantics_are_uncertain,
-        ) = self._filesystem_semantics_uncertainty(parent_directory_path)
+        ) = self._filesystem_semantics_uncertainty(
+            parent_directory_path,
+            evidence_cache=evidence_cache,
+        )
         evidence_reasons.extend(filesystem_uncertainty_reasons)
         model_has_uncertain_evidence |= filesystem_semantics_are_uncertain
 
@@ -3394,6 +3656,7 @@ class LinuxFilesystemMutationPermissionAuditor:
             parent_directory_path,
             parent_directory_metadata,
             target_metadata,
+            evidence_cache=evidence_cache,
         )
         evidence_reasons.extend(parent_reasons)
         model_has_uncertain_evidence |= parent_has_uncertain_evidence
@@ -3431,18 +3694,18 @@ class LinuxFilesystemMutationPermissionAuditor:
         parent_directory_path: str,
         parent_directory_metadata: os.stat_result,
         target_metadata: os.stat_result,
+        *,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> tuple[list[EvidenceReason], bool, bool]:
         evidence_reasons: list[EvidenceReason] = []
         model_has_uncertain_evidence = False
         model_has_blocking_evidence = False
 
-        write_access = self.ask_kernel_about_access(
-            parent_directory_path,
-            os.W_OK,
-        )
-        search_access = self.ask_kernel_about_access(
-            parent_directory_path,
-            os.X_OK,
+        write_access, search_access = (
+            self._ask_kernel_about_write_and_search_within_path_assessment(
+                parent_directory_path,
+                evidence_cache=evidence_cache,
+            )
         )
         for access_evidence, blocked_reason_code in (
             (write_access, "parent_directory_is_not_writable"),
@@ -3480,14 +3743,18 @@ class LinuxFilesystemMutationPermissionAuditor:
         ) = self._infer_mount_write_constraint(
             parent_directory_path,
             read_only_reason_code="parent_directory_mount_is_read_only",
+            evidence_cache=evidence_cache,
         )
         evidence_reasons.extend(mount_reasons)
         model_has_uncertain_evidence |= mount_is_uncertain
         model_has_blocking_evidence |= mount_blocks_mutation
 
-        parent_attribute_evidence = observe_linux_inode_attributes(
-            parent_directory_path,
-            follow_final_symbolic_link=True,
+        parent_attribute_evidence = (
+            self._observe_inode_attributes_within_path_assessment(
+                parent_directory_path,
+                follow_final_symbolic_link=True,
+                evidence_cache=evidence_cache,
+            )
         )
         if parent_attribute_evidence.immutable_attribute_is_set is True:
             evidence_reasons.append(
@@ -3598,6 +3865,8 @@ class LinuxFilesystemMutationPermissionAuditor:
         path: str,
         filesystem_object_kind: str,
         requested_content_capability: str,
+        *,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> CapabilityModelInference:
         if requested_content_capability not in {
             CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
@@ -3624,9 +3893,12 @@ class LinuxFilesystemMutationPermissionAuditor:
         model_has_uncertain_evidence = False
         model_has_blocking_evidence = False
 
-        inode_attribute_evidence = observe_linux_inode_attributes(
-            path,
-            follow_final_symbolic_link=True,
+        inode_attribute_evidence = (
+            self._observe_inode_attributes_within_path_assessment(
+                path,
+                follow_final_symbolic_link=True,
+                evidence_cache=evidence_cache,
+            )
         )
         if inode_attribute_evidence.immutable_attribute_is_set is True:
             evidence_reasons.append(
@@ -3680,7 +3952,10 @@ class LinuxFilesystemMutationPermissionAuditor:
         (
             filesystem_uncertainty_reasons,
             filesystem_semantics_are_uncertain,
-        ) = self._filesystem_semantics_uncertainty(path)
+        ) = self._filesystem_semantics_uncertainty(
+            path,
+            evidence_cache=evidence_cache,
+        )
         evidence_reasons.extend(filesystem_uncertainty_reasons)
         model_has_uncertain_evidence |= filesystem_semantics_are_uncertain
 
@@ -3691,12 +3966,17 @@ class LinuxFilesystemMutationPermissionAuditor:
         ) = self._infer_mount_write_constraint(
             path,
             read_only_reason_code="target_mount_is_read_only",
+            evidence_cache=evidence_cache,
         )
         evidence_reasons.extend(mount_reasons)
         model_has_uncertain_evidence |= mount_is_uncertain
         model_has_blocking_evidence |= mount_blocks_mutation
 
-        write_access_evidence = self.ask_kernel_about_access(path, os.W_OK)
+        write_access_evidence = self._ask_kernel_about_access_within_path_assessment(
+            path,
+            os.W_OK,
+            evidence_cache=evidence_cache,
+        )
         if write_access_evidence.access_is_allowed is False:
             evidence_reasons.append(
                 EvidenceReason(
@@ -3721,6 +4001,8 @@ class LinuxFilesystemMutationPermissionAuditor:
         self,
         directory_path: str,
         directory_metadata: os.stat_result,
+        *,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> CapabilityModelInference:
         if not stat.S_ISDIR(directory_metadata.st_mode):
             return capability_inference(
@@ -3738,9 +4020,12 @@ class LinuxFilesystemMutationPermissionAuditor:
         model_has_uncertain_evidence = False
         model_has_blocking_evidence = False
 
-        inode_attribute_evidence = observe_linux_inode_attributes(
-            directory_path,
-            follow_final_symbolic_link=True,
+        inode_attribute_evidence = (
+            self._observe_inode_attributes_within_path_assessment(
+                directory_path,
+                follow_final_symbolic_link=True,
+                evidence_cache=evidence_cache,
+            )
         )
         if inode_attribute_evidence.immutable_attribute_is_set is True:
             evidence_reasons.append(
@@ -3764,7 +4049,10 @@ class LinuxFilesystemMutationPermissionAuditor:
         (
             filesystem_uncertainty_reasons,
             filesystem_semantics_are_uncertain,
-        ) = self._filesystem_semantics_uncertainty(directory_path)
+        ) = self._filesystem_semantics_uncertainty(
+            directory_path,
+            evidence_cache=evidence_cache,
+        )
         evidence_reasons.extend(filesystem_uncertainty_reasons)
         model_has_uncertain_evidence |= filesystem_semantics_are_uncertain
 
@@ -3775,19 +4063,22 @@ class LinuxFilesystemMutationPermissionAuditor:
         ) = self._infer_mount_write_constraint(
             directory_path,
             read_only_reason_code="directory_mount_is_read_only",
+            evidence_cache=evidence_cache,
         )
         evidence_reasons.extend(mount_reasons)
         model_has_uncertain_evidence |= mount_is_uncertain
         model_has_blocking_evidence |= mount_blocks_mutation
 
-        for requested_access_mode, blocked_reason_code in (
-            (os.W_OK, "directory_is_not_writable"),
-            (os.X_OK, "directory_is_not_searchable"),
-        ):
-            access_evidence = self.ask_kernel_about_access(
+        write_access, search_access = (
+            self._ask_kernel_about_write_and_search_within_path_assessment(
                 directory_path,
-                requested_access_mode,
+                evidence_cache=evidence_cache,
             )
+        )
+        for access_evidence, blocked_reason_code in (
+            (write_access, "directory_is_not_writable"),
+            (search_access, "directory_is_not_searchable"),
+        ):
             if access_evidence.access_is_allowed is False:
                 evidence_reasons.append(
                     EvidenceReason(
@@ -3898,6 +4189,8 @@ class LinuxFilesystemMutationPermissionAuditor:
         self,
         path: str,
         filesystem_object_kind: str,
+        *,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> CapabilityModelInference:
         if filesystem_object_kind in {
             FILESYSTEM_OBJECT_KIND_UNOBSERVED,
@@ -3940,9 +4233,12 @@ class LinuxFilesystemMutationPermissionAuditor:
         model_has_uncertain_evidence = False
         model_has_blocking_evidence = False
 
-        inode_attribute_evidence = observe_linux_inode_attributes(
-            path,
-            follow_final_symbolic_link=True,
+        inode_attribute_evidence = (
+            self._observe_inode_attributes_within_path_assessment(
+                path,
+                follow_final_symbolic_link=True,
+                evidence_cache=evidence_cache,
+            )
         )
         if inode_attribute_evidence.immutable_attribute_is_set is True:
             evidence_reasons.append(
@@ -3967,7 +4263,10 @@ class LinuxFilesystemMutationPermissionAuditor:
         (
             filesystem_uncertainty_reasons,
             filesystem_semantics_are_uncertain,
-        ) = self._filesystem_semantics_uncertainty(path)
+        ) = self._filesystem_semantics_uncertainty(
+            path,
+            evidence_cache=evidence_cache,
+        )
         evidence_reasons.extend(filesystem_uncertainty_reasons)
         model_has_uncertain_evidence |= filesystem_semantics_are_uncertain
 
@@ -3975,12 +4274,20 @@ class LinuxFilesystemMutationPermissionAuditor:
         # I/O through a FIFO/socket/device node varies by object and kernel
         # path, so os.access plus an explicit runtime-semantics boundary is more
         # accurate than treating mount "ro" as a universal hard failure here.
-        mount_lookup = self.mount_table.lookup_mount_for_path(path)
+        mount_lookup = self._lookup_mount_within_path_assessment(
+            path,
+            follow_final_symbolic_link=True,
+            evidence_cache=evidence_cache,
+        )
         if mount_lookup.uncertainty_reasons:
             evidence_reasons.extend(mount_lookup.uncertainty_reasons)
             model_has_uncertain_evidence = True
 
-        write_access_evidence = self.ask_kernel_about_access(path, os.W_OK)
+        write_access_evidence = self._ask_kernel_about_access_within_path_assessment(
+            path,
+            os.W_OK,
+            evidence_cache=evidence_cache,
+        )
         if write_access_evidence.access_is_allowed is False:
             evidence_reasons.append(
                 EvidenceReason(
@@ -4004,8 +4311,14 @@ class LinuxFilesystemMutationPermissionAuditor:
     def _filesystem_semantics_uncertainty(
         self,
         path: str,
+        *,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> tuple[list[EvidenceReason], bool]:
-        mount_lookup = self.mount_table.lookup_mount_for_path(path)
+        mount_lookup = self._lookup_mount_within_path_assessment(
+            path,
+            follow_final_symbolic_link=True,
+            evidence_cache=evidence_cache,
+        )
         evidence_reasons = list(mount_lookup.uncertainty_reasons)
         filesystem_semantics_are_uncertain = bool(evidence_reasons)
 
@@ -4038,8 +4351,13 @@ class LinuxFilesystemMutationPermissionAuditor:
         path: str,
         *,
         read_only_reason_code: str,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> tuple[list[EvidenceReason], bool, bool]:
-        mount_lookup = self.mount_table.lookup_mount_for_path(path)
+        mount_lookup = self._lookup_mount_within_path_assessment(
+            path,
+            follow_final_symbolic_link=True,
+            evidence_cache=evidence_cache,
+        )
         if mount_lookup.uncertainty_reasons:
             return (
                 list(mount_lookup.uncertainty_reasons),
@@ -4883,6 +5201,21 @@ def structured_record_should_be_emitted(
     )
 
 
+def path_assessment_should_be_emitted(
+    assessment: PathCapabilityAssessment,
+    *,
+    configuration: AuditCommandLineConfiguration,
+) -> bool:
+    """Apply the default allowed-capability filter before record allocation."""
+    if configuration.include_nonmatching_records:
+        return True
+    return any(
+        assessment.inference_for_capability(capability_name).model_verdict
+        == MODEL_VERDICT_INDICATES_ALLOWED
+        for capability_name in configuration.selected_capabilities
+    )
+
+
 def output_stream_is_attached_to_terminal(output_stream: TextIO) -> bool:
     """Treat an unavailable or failed terminal query as noninteractive output."""
     try:
@@ -4916,6 +5249,11 @@ def iterate_structured_path_audit_records(
             normalized_scan_root,
             selected_capabilities=selected_capabilities,
         ):
+            if not path_assessment_should_be_emitted(
+                path_assessment,
+                configuration=configuration,
+            ):
+                continue
             structured_record = path_assessment.create_structured_record(
                 selected_capabilities=selected_capabilities,
                 originating_scan_root_path=normalized_scan_root,
@@ -4929,6 +5267,12 @@ def iterate_structured_path_audit_records(
 
 def escape_linux_path_text_for_terminal(path_text: str) -> str:
     """Render arbitrary Linux filename bytes on exactly one terminal line."""
+    # Most paths need no escaping.  str.isprintable performs its scan in C;
+    # quotes and backslashes are the only printable characters transformed by
+    # the complete encoder below.
+    if path_text.isprintable() and "\\" not in path_text and '"' not in path_text:
+        return path_text
+
     escaped_characters: list[str] = []
     short_control_escape_by_character = {
         "\b": r"\b",
