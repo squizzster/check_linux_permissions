@@ -21,12 +21,18 @@ Requirements: Linux and Python 3.9 or newer. There are no third-party Python
 dependencies.
 
 ```bash
-./check_permissions.py /path/to/check
+./check_permissions.py
 ```
 
-You can provide more than one path:
+With no path argument, the tool scans `/` recursively and reports paths where
+the current process has at least one modeled mutation capability. The default
+root scan excludes `/proc` and the active writable temporary directory, and it
+does not traverse discovered process-related home directories.
+
+Provide one or more paths for a smaller, focused audit:
 
 ```bash
+./check_permissions.py /path/to/check
 ./check_permissions.py /etc /opt/my-service /srv/data
 ```
 
