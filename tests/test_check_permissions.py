@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -2144,6 +2145,42 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 [],
             )
 
+    def test_exchange_ctime_change_does_not_hide_other_metadata_changes(
+        self,
+    ) -> None:
+        observation_before_exchange = audit_under_test.ReportDestinationObservation(
+            filesystem_identity=audit_under_test.FilesystemObjectIdentity(10, 20),
+            inode_change_time_nanoseconds=100,
+            content_modification_time_nanoseconds=90,
+            file_size_bytes=12,
+            permission_and_type_mode=stat.S_IFREG | 0o600,
+            owner_user_id=1000,
+            owner_group_id=1000,
+            hard_link_count=1,
+        )
+        observation_after_exchange = replace(
+            observation_before_exchange,
+            inode_change_time_nanoseconds=101,
+        )
+
+        self.assertTrue(
+            observation_after_exchange.matches_after_directory_entry_exchange(
+                observation_before_exchange
+            )
+        )
+        self.assertFalse(
+            replace(
+                observation_after_exchange,
+                owner_user_id=1001,
+            ).matches_after_directory_entry_exchange(observation_before_exchange)
+        )
+        self.assertFalse(
+            replace(
+                observation_after_exchange,
+                inode_change_time_nanoseconds=99,
+            ).matches_after_directory_entry_exchange(observation_before_exchange)
+        )
+
     def test_authorized_replacement_preserves_old_report_until_exit(
         self,
     ) -> None:
@@ -2307,7 +2344,7 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 [],
             )
 
-    def test_destination_changed_during_audit_is_exchanged_back(
+    def test_destination_changed_during_audit_is_not_replaced(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

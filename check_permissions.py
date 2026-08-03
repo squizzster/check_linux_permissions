@@ -5509,6 +5509,8 @@ class ReportDestinationObservation:
     content_modification_time_nanoseconds: int
     file_size_bytes: int
     permission_and_type_mode: int
+    owner_user_id: int
+    owner_group_id: int
     hard_link_count: int
 
     @classmethod
@@ -5524,7 +5526,28 @@ class ReportDestinationObservation:
             content_modification_time_nanoseconds=(filesystem_metadata.st_mtime_ns),
             file_size_bytes=filesystem_metadata.st_size,
             permission_and_type_mode=filesystem_metadata.st_mode,
+            owner_user_id=filesystem_metadata.st_uid,
+            owner_group_id=filesystem_metadata.st_gid,
             hard_link_count=filesystem_metadata.st_nlink,
+        )
+
+    def matches_after_directory_entry_exchange(
+        self,
+        observation_before_exchange: ReportDestinationObservation,
+    ) -> bool:
+        """Compare fields that an entry exchange does not itself change."""
+        return (
+            self.filesystem_identity == observation_before_exchange.filesystem_identity
+            and self.inode_change_time_nanoseconds
+            >= observation_before_exchange.inode_change_time_nanoseconds
+            and self.content_modification_time_nanoseconds
+            == observation_before_exchange.content_modification_time_nanoseconds
+            and self.file_size_bytes == observation_before_exchange.file_size_bytes
+            and self.permission_and_type_mode
+            == observation_before_exchange.permission_and_type_mode
+            and self.owner_user_id == observation_before_exchange.owner_user_id
+            and self.owner_group_id == observation_before_exchange.owner_group_id
+            and self.hard_link_count == observation_before_exchange.hard_link_count
         )
 
 
@@ -5872,6 +5895,23 @@ class PrivateReportPublication:
         destination_directory_file_descriptor = (
             self._require_destination_directory_file_descriptor()
         )
+        destination_metadata_before_exchange = lstat_directory_entry_if_present(
+            destination_directory_file_descriptor,
+            self.destination_entry_name,
+        )
+        if (
+            destination_metadata_before_exchange is None
+            or ReportDestinationObservation.from_stat_result(
+                destination_metadata_before_exchange
+            )
+            != pre_audit_destination_observation
+        ):
+            raise ReportPublicationError(
+                "refusing to replace a destination whose identity or "
+                "metadata changed during the audit: "
+                f"{quote_path_for_diagnostic(self.destination_path)}"
+            )
+
         rename_linux_directory_entry_with_flags(
             destination_directory_file_descriptor,
             self.unpublished_report_entry_name,
@@ -5893,7 +5933,13 @@ class PrivateReportPublication:
                     displaced_destination_metadata
                 )
             )
-            if displaced_destination_observation != pre_audit_destination_observation:
+            # Some Linux filesystems update inode ctime for RENAME_EXCHANGE.
+            # The full observation was compared immediately before exchange;
+            # afterward, accept only a forward ctime change while continuing
+            # to validate identity and every other captured metadata field.
+            if not displaced_destination_observation.matches_after_directory_entry_exchange(
+                pre_audit_destination_observation
+            ):
                 raise ReportPublicationError(
                     "refusing to replace a destination whose identity or "
                     "metadata changed during the audit: "
@@ -5919,9 +5965,8 @@ class PrivateReportPublication:
             current_displaced_destination_observation = (
                 ReportDestinationObservation.from_stat_result(displaced_entry_metadata)
             )
-            if (
-                current_displaced_destination_observation
-                != pre_audit_destination_observation
+            if not current_displaced_destination_observation.matches_after_directory_entry_exchange(
+                pre_audit_destination_observation
             ):
                 raise ReportPublicationError(
                     "the synchronized report is published, but the displaced "
