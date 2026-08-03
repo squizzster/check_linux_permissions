@@ -111,7 +111,22 @@ as questions that need answers.
 No output for a path means the model did not find an allowed selected
 capability in the emitted results. It is useful evidence, but it is not proof
 that the account is harmless or that every possible mutation route was
-modeled.
+modeled. The default human presentation stays focused on actionable paths and
+does not print an uncertainty summary. Default JSON is permission-focused too:
+expected background limitations are omitted rather than reported as if the run
+failed. Use `--full-audit` when you deliberately want every conclusion and
+routine limitation.
+
+Uncertainty is graded:
+
+- **routine** covers expected whole-system-scan conditions such as access-denied
+  directory listing, derivative descendant caveats, and conservative branches
+  where the owner might first change mode or inode flags. It is retained by the
+  audit but omitted from normal human and JSON output;
+- **material** covers unexpected evidence or coverage failures such as I/O
+  errors, descriptor exhaustion, identity races, malformed kernel evidence, or
+  unresolved credential and mount state. Material uncertainty remains visible
+  in JSON and is what `--fail-on-uncertainty` enforces.
 
 ## Install and run
 
@@ -120,6 +135,12 @@ Requirements:
 - Linux;
 - Python 3.9 or newer;
 - no third-party Python dependencies.
+
+The command performs an explicit runtime check. macOS, the BSDs, and Windows
+receive an unsupported-backend diagnostic rather than failing inside a
+Linux-specific import or syscall. Their credential, mount, inode-flag, and
+access semantics need native backends; this release does not pretend that a
+generic Unix approximation is equivalent to the Linux audit.
 
 Clone the repository and inspect the available options:
 
@@ -155,7 +176,10 @@ With no path argument, the tool scans `/` recursively:
 
 The default no-path scan excludes `/proc` and the first active writable
 temporary directory, and it does not traverse discovered process-related home
-directories. Explicitly provided roots are not automatically excluded.
+directories. Discovered home and temporary paths are resolved as directories
+with kernel component semantics; a candidate that cannot be resolved is not
+silently excluded and contributes run-level uncertainty. Explicitly provided
+roots are not automatically excluded.
 
 For containment reviews, explicitly naming sensitive roots is often clearer
 than relying only on the default scan.
@@ -322,6 +346,11 @@ Linux does not have one universal “can write this path” permission.
   append-only.
 - **Read-only mounts and protected inodes** can block changes that ordinary mode
   bits appear to allow.
+- **An inode owner can often change its mode first.** A current access denial
+  therefore becomes routine uncertainty when ownership or possible
+  `CAP_FOWNER` authority could permit a preceding `chmod`; the tool does not
+  execute that metadata change or claim it would succeed. `--full-audit`
+  exposes that conservative branch.
 - **Symbolic links behave differently by operation.** Deletion applies to the
   link entry; content checks follow the link to the target.
 - **Deleting a directory tree** requires the assessed descendants to be
@@ -382,6 +411,11 @@ The following options add locations back to a default no-path scan:
 
 Explicitly provided scan roots are not automatically excluded.
 
+Input paths retain kernel-significant `.` and `..` components and trailing
+slashes until Linux resolves them. For example, if an intermediate component
+is a symbolic link, `link/../target` is not rewritten lexically before the
+kernel sees it.
+
 Mark an additional filesystem type as uncertain when its mutation semantics
 need conservative treatment beyond the built-in set:
 
@@ -393,6 +427,17 @@ need conservative treatment beyond the built-in set:
 
 Use `./check_permissions.py --version` to print the tool version.
 
+Require a nonzero result whenever selected-capability or run-level evidence has
+material uncertainty:
+
+```bash
+./check_permissions.py --fail-on-uncertainty /srv/application
+```
+
+The report is completed first, then the command exits with status `5`, so the
+material evidence remains available for diagnosis. Routine uncertainty does
+not make this option fail.
+
 ## JSON output and complete evidence
 
 When stdout is redirected or piped, output automatically becomes JSON Lines.
@@ -403,19 +448,28 @@ Use `--json` (or its alias `--machine`) to request it explicitly:
 ```
 
 By default, only records with at least one model-allowed selected capability
-are emitted. Add `--include-nonmatching-records` when you also need blocked,
-uncertain, and skipped conclusions:
+are emitted, and routine uncertainty fields are omitted. Request a full audit
+when you need blocked, skipped, and both grades of uncertain conclusions:
 
 ```bash
 ./check_permissions.py \
-  --json \
-  --include-nonmatching-records \
+  --full-audit \
   /srv/application > complete-assessment.jsonl
 ```
 
+`--full-audit` implies all assessed records and selects JSON automatically
+unless `--human` is explicitly requested. `--include-nonmatching-records`
+remains available as the older explicit spelling for including the complete
+record set and its routine evidence.
+
 Each JSON path record includes capability evidence and the run, process,
 mount-table, scope, and source identity needed to interpret it independently.
-A provenance record is emitted even when no path record matches.
+A provenance record is emitted even when no path record matches. A successful
+JSONL generation ends with an `audit_run_completion` record. Normal output adds
+material-uncertainty fields only when material uncertainty occurred; full-audit
+output includes counts split into `routine` and `material` grades. A stream
+that ends without the completion marker is incomplete, regardless of how many
+individually valid JSON lines precede it.
 
 Use `--human` (or its alias `--tty`) to force compact path output through a
 pipe or into a file:
@@ -455,14 +509,33 @@ The audit combines:
 
 - real, effective, saved, filesystem, and supplementary process identities;
 - effective Linux capabilities;
-- kernel access checks using effective IDs when supported;
+- errno-preserving `faccessat2` access checks using effective IDs and stable
+  descriptors;
 - file type, ownership, mode bits, sticky-directory rules, and link targets;
 - the visible Linux mount table and read-only mount state;
 - immutable, append-only, and verity inode attributes reported by `statx`;
 - parent and descendant results needed for delete-tree conclusions.
 
-Unavailable or insufficient evidence is reported as uncertainty rather than
-silently treated as permission.
+Traversal keeps an `O_PATH` descriptor chain. Child capture, metadata,
+`statx`, access, and mount-ID observations are relative to those stable
+descriptors, so renaming a scanned parent cannot redirect the walk into a
+replacement tree. Directory entries are consumed lazily in filesystem order;
+the tool does not allocate a list proportional to the number of children in a
+flat directory. Descriptor use grows with active directory depth. If the
+process or system descriptor limit is reached, enumeration stops at that
+directory with named material incomplete-scope uncertainty instead of retrying
+through racy absolute paths.
+
+When libc lacks `statx` or `renameat2`, verified per-architecture raw syscall
+fallbacks are used. On kernels without `faccessat2`, `faccessat` is used only
+when real, effective, and filesystem IDs match, the identity is non-root, and
+the observed effective capability mask is empty. That restricted case preserves
+both kernel ACL evaluation and the needed identity/capability semantics. Other
+legacy or unfamiliar ABI cases remain explicit uncertainty.
+
+Unavailable or insufficient evidence is retained rather than silently treated
+as permission. Expected limitations are graded routine and shown only by a
+full audit; unexpected evidence failures are graded material.
 
 ## What this tool does not tell you
 
@@ -499,9 +572,12 @@ filesystem-specific behavior. Use a snapshot or read-only mount when strict
 non-interference is required.
 
 Results are a best-effort model, not proof that a future system call will
-succeed. Live filesystem races, ACL and idmapped-mount details, SELinux/AppArmor
-or other LSM policy, seccomp, leases, quotas, resource limits, remote
-filesystems, and special endpoint behavior can differ from the modeled result.
+succeed. Descriptor-relative traversal prevents parent-name redirection but
+does not create an atomic namespace snapshot: entries, credentials, mounts,
+ACLs, and policy can still change between observations. Idmapped-mount details,
+SELinux/AppArmor or other operation-specific LSM policy, seccomp, leases,
+quotas, resource limits, remote filesystems, and special endpoint behavior can
+differ from the modeled result.
 
 Run the tool from a trusted copy. An audit performed with a modified script or
 under a different identity does not describe the boundary you intended to
@@ -528,6 +604,7 @@ flags.
 | `2` | Command-line input or root execution was refused |
 | `3` | Report destination or output failed |
 | `4` | An unexpected audit runtime failure occurred |
+| `5` | Audit/report completed, but `--fail-on-uncertainty` found material uncertainty |
 | `130` | The process was interrupted |
 
 Broken stdout pipes exit successfully so commands such as
