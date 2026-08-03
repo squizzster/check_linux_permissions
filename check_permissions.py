@@ -7,15 +7,23 @@ The standalone tool requires Linux and Python 3.9 or newer.
 This program observes Linux metadata and asks the kernel permission questions;
 it does not prove that a future mutation syscall will succeed.  Every structured
 record names the model version, observation time, process-credential evidence,
-mount-table evidence, source-code digest, modeled conclusions, and unresolved
-uncertainty.  Live filesystem races, MAC/LSM policy, leases, idmapped mounts,
-remote filesystems, and device-specific behavior can still disagree with the
-model.
+mount-table evidence, source-code digest, and modeled conclusions.  Routine
+limitations are retained but omitted from normal output; ``--full-audit``
+includes routine and material uncertainty.  Live filesystem races, MAC/LSM
+policy, leases, idmapped mounts, remote filesystems, and device-specific
+behavior can still disagree with the model.
+
+Traversal captures each object and its parent with Linux O_PATH descriptors.
+Directory entries are consumed lazily, and every metadata, access, statx, and
+mount-ID query uses the captured identity.  This prevents a renamed parent from
+redirecting the walk, without claiming an atomic filesystem snapshot.
 
 Standard output uses compact, human-readable paths when it is attached to a
 terminal and self-contained JSON Lines when it is redirected or piped.
 ``--tty``/``--human`` and ``--json``/``--machine`` override that automatic
 selection.
+Completed JSONL output ends with an audit_run_completion record; absent that
+marker, the stream is incomplete.
 
 Audited paths are never intentionally opened for writing, created, removed,
 renamed, chmodded, chowned, or assigned inode flags.  Directory listing requests
@@ -42,7 +50,6 @@ import errno
 import hashlib
 import json
 import os
-import pwd
 import stat
 import sys
 import uuid
@@ -53,11 +60,16 @@ from pathlib import Path
 from types import TracebackType
 from typing import TextIO, TypeVar, Union
 
+try:
+    import pwd
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    pwd = None  # type: ignore[assignment]
+
 AUDIT_TOOL_NAME = "check_permissions.py"
-AUDIT_TOOL_VERSION = "3.0.0"
-CAPABILITY_MODEL_ID = "linux-filesystem-mutation-permission-model/v2"
-STRUCTURED_RECORD_SCHEMA_ID = "linux-filesystem-permission-audit-record/v2"
-AUDIT_RUN_PROVENANCE_SCHEMA_ID = "linux-filesystem-permission-audit-run-provenance/v2"
+AUDIT_TOOL_VERSION = "4.0.0"
+CAPABILITY_MODEL_ID = "linux-filesystem-mutation-permission-model/v3"
+STRUCTURED_RECORD_SCHEMA_ID = "linux-filesystem-permission-audit-record/v3"
+AUDIT_RUN_PROVENANCE_SCHEMA_ID = "linux-filesystem-permission-audit-run-provenance/v3"
 
 _OS_PATH_REALPATH_SUPPORTS_STRICT = sys.version_info >= (3, 10)
 STRICT_PATH_RESOLUTION_EVIDENCE_SOURCE = (
@@ -70,6 +82,7 @@ EXIT_AUDIT_COMPLETED = 0
 EXIT_COMMAND_LINE_REFUSED = 2
 EXIT_REPORT_OUTPUT_FAILED = 3
 EXIT_AUDIT_RUNTIME_FAILED = 4
+EXIT_AUDIT_EVIDENCE_UNCERTAIN = 5
 EXIT_INTERRUPTED = 130
 
 CAPABILITY_DELETE_ENTRY_OR_TREE = "delete_entry_or_tree"
@@ -143,6 +156,9 @@ MODEL_VERDICT_INDICATES_BLOCKED = "model_indicates_blocked"
 MODEL_VERDICT_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 MODEL_VERDICT_SKIPPED = "skipped"
 
+UNCERTAINTY_GRADE_ROUTINE = "routine"
+UNCERTAINTY_GRADE_MATERIAL = "material"
+
 FILESYSTEM_OBJECT_KIND_REGULAR_FILE = "regular_file"
 FILESYSTEM_OBJECT_KIND_DIRECTORY = "directory"
 FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK = "symbolic_link"
@@ -155,6 +171,8 @@ FILESYSTEM_OBJECT_KIND_UNOBSERVED = "unobserved"
 FILESYSTEM_OBJECT_KIND_MISSING = "missing"
 
 LINUX_CAPABILITY_FOWNER_NUMBER = 3
+LINUX_CAPABILITY_LINUX_IMMUTABLE_NUMBER = 9
+LINUX_CAPABILITY_SYS_ADMIN_NUMBER = 21
 ACCESS_IDENTITY_MODEL_FILESYSTEM_AUTHORITY_WHEN_IDS_MATCH = (
     "effective_id_kernel_access_query_when_effective_and_filesystem_ids_match"
 )
@@ -244,6 +262,89 @@ class EvidenceReason:
         return serialized_reason
 
 
+ROUTINE_UNCERTAINTY_REASON_CODES = frozenset(
+    {
+        # A whole-filesystem scan normally reaches directories that this
+        # credential cannot enumerate.  That is expected evidence about the
+        # credential, not an abnormal failure of the audit machinery.
+        "at_least_one_descendant_has_uncertain_delete_inference",
+        # These branches deliberately avoid executing a preparatory chmod or
+        # FS_IOC_SETFLAGS operation.  They are useful in a full diagnostic
+        # report but are too conservative to pollute the permission-finding
+        # view used by default.
+        "parent_directory_access_may_be_changeable_by_chmod",
+        "target_write_access_may_be_changeable_by_chmod",
+        "directory_access_may_be_changeable_by_chmod",
+        "special_file_write_access_may_be_changeable_by_chmod",
+        "target_immutable_attribute_may_be_clearable_before_deletion",
+        "target_append_only_attribute_may_be_clearable_before_deletion",
+        "parent_directory_immutable_attribute_may_be_clearable_before_deletion",
+        "parent_directory_append_only_attribute_may_be_clearable_before_deletion",
+        "target_immutable_attribute_may_be_clearable_before_content_mutation",
+        "target_append_only_attribute_may_be_clearable_before_overwrite",
+        "directory_immutable_attribute_may_be_clearable_before_creation",
+        "target_immutable_attribute_may_be_clearable_before_special_file_write",
+    }
+)
+
+
+def evidence_reason_uncertainty_grade(reason: EvidenceReason) -> str | None:
+    """Grade a reason only when it represents uncertainty rather than fact."""
+    if reason.reason_code in ROUTINE_UNCERTAINTY_REASON_CODES:
+        return UNCERTAINTY_GRADE_ROUTINE
+    if reason.reason_code in {
+        "cannot_list_directory",
+        "cannot_continue_directory_listing",
+    } and reason.operating_system_errno in {errno.EACCES, errno.EPERM}:
+        return UNCERTAINTY_GRADE_ROUTINE
+    if (
+        reason.reason_code
+        in {
+            "path_disappeared_during_directory_scan",
+            "cannot_capture_directory_entry",
+        }
+        and reason.operating_system_errno == errno.ENOENT
+    ):
+        return UNCERTAINTY_GRADE_ROUTINE
+
+    material_uncertainty_fragments = (
+        "cannot_",
+        "_changed_",
+        "_changed",
+        "_failed",
+        "_failure",
+        "_unavailable",
+        "_unobserved",
+        "_unknown",
+        "_uncertain",
+        "_unrecognized",
+        "unmodeled",
+        "not_modeled",
+        "may_reflect",
+    )
+    if any(
+        fragment in reason.reason_code for fragment in material_uncertainty_fragments
+    ):
+        return UNCERTAINTY_GRADE_MATERIAL
+    return None
+
+
+def uncertainty_grade_for_reason_sequence(
+    reasons: Iterable[EvidenceReason],
+) -> str:
+    """Return the highest grade; unclassified uncertain evidence is material."""
+    observed_grades = {
+        grade
+        for reason in reasons
+        if (grade := evidence_reason_uncertainty_grade(reason)) is not None
+    }
+    if UNCERTAINTY_GRADE_MATERIAL in observed_grades:
+        return UNCERTAINTY_GRADE_MATERIAL
+    if UNCERTAINTY_GRADE_ROUTINE in observed_grades:
+        return UNCERTAINTY_GRADE_ROUTINE
+    return UNCERTAINTY_GRADE_MATERIAL
+
+
 CAPABILITY_MODEL_BOUNDARY_REASONS: tuple[EvidenceReason, ...] = (
     EvidenceReason(
         "mutation_syscalls_are_not_executed",
@@ -265,10 +366,23 @@ CAPABILITY_MODEL_BOUNDARY_REASONS: tuple[EvidenceReason, ...] = (
     EvidenceReason(
         "idmapped_mount_ownership_translation_is_not_modeled",
         evidence_source=CAPABILITY_MODEL_ID,
+        detail=(
+            "kernel access queries and stat metadata use the mount-translated "
+            "view, but mountinfo does not expose the attached ID mapping and "
+            "effective capability namespace scope is not proven"
+        ),
     ),
     EvidenceReason(
         "resource_limits_quotas_leases_and_capacity_are_not_modeled",
         evidence_source=CAPABILITY_MODEL_ID,
+    ),
+    EvidenceReason(
+        "preparatory_discretionary_metadata_mutations_are_not_fully_modeled",
+        evidence_source=CAPABILITY_MODEL_ID,
+        detail=(
+            "owner or CAP_FOWNER authority that might permit a preceding chmod "
+            "turns a current access denial into uncertainty, not permission"
+        ),
     ),
     EvidenceReason(
         "remote_filesystem_server_and_special_endpoint_behavior_is_not_modeled",
@@ -381,6 +495,8 @@ class ObservedLinuxFilesystemObjectMetadata:
 # informative than locally invented synonyms.
 AT_FDCWD = -100
 AT_SYMLINK_NOFOLLOW = 0x100
+AT_EMPTY_PATH = 0x1000
+AT_EACCESS = 0x200
 STATX_ALL = 0x00000FFF
 STATX_ATTR_IMMUTABLE = 0x00000010
 STATX_ATTR_APPEND = 0x00000020
@@ -391,7 +507,52 @@ LINUX_STATX_ATTRIBUTES_OFFSET_BYTES = 8
 LINUX_STATX_ATTRIBUTES_MASK_OFFSET_BYTES = 56
 RENAME_NOREPLACE = 1
 RENAME_EXCHANGE = 2
-RUNNING_LINUX_KERNEL_RELEASE = os.uname().release
+RUNNING_LINUX_KERNEL_RELEASE = (
+    os.uname().release if sys.platform.startswith("linux") else "unavailable"
+)
+RUNNING_MACHINE_ARCHITECTURE = (
+    os.uname().machine.lower() if sys.platform.startswith("linux") else "unavailable"
+)
+
+# Linux syscall numbers are ABI values, not universal API constants.  Keep the
+# supported map deliberately explicit so an unfamiliar ABI degrades to named
+# uncertainty instead of invoking the wrong syscall.  Most newer architectures
+# use asm-generic numbers; legacy architectures retain their own tables.
+_LINUX_SYSCALL_NUMBERS_BY_ARCHITECTURE: Mapping[str, Mapping[str, int]] = {
+    "x86_64": {"renameat2": 316, "statx": 332, "faccessat2": 439},
+    "i386": {"renameat2": 353, "statx": 383, "faccessat2": 439},
+    "i486": {"renameat2": 353, "statx": 383, "faccessat2": 439},
+    "i586": {"renameat2": 353, "statx": 383, "faccessat2": 439},
+    "i686": {"renameat2": 353, "statx": 383, "faccessat2": 439},
+    "aarch64": {"renameat2": 276, "statx": 291, "faccessat2": 439},
+    "arm64": {"renameat2": 276, "statx": 291, "faccessat2": 439},
+    "armv7l": {"renameat2": 382, "statx": 397, "faccessat2": 439},
+    "armv8l": {"renameat2": 382, "statx": 397, "faccessat2": 439},
+    "riscv64": {"renameat2": 276, "statx": 291, "faccessat2": 439},
+    "loongarch64": {"renameat2": 276, "statx": 291, "faccessat2": 439},
+    "s390x": {"renameat2": 347, "statx": 379, "faccessat2": 439},
+    "ppc64": {"renameat2": 357, "statx": 383, "faccessat2": 439},
+    "ppc64le": {"renameat2": 357, "statx": 383, "faccessat2": 439},
+    "sparc64": {"renameat2": 345, "statx": 360, "faccessat2": 439},
+    "alpha": {"renameat2": 510, "statx": 522, "faccessat2": 549},
+}
+_LINUX_64_BIT_SYSCALL_ARCHITECTURES = frozenset(
+    {
+        "x86_64",
+        "aarch64",
+        "arm64",
+        "riscv64",
+        "loongarch64",
+        "s390x",
+        "ppc64",
+        "ppc64le",
+        "sparc64",
+        "alpha",
+    }
+)
+_LINUX_32_BIT_SYSCALL_ARCHITECTURES = frozenset(
+    {"i386", "i486", "i586", "i686", "armv7l", "armv8l"}
+)
 
 
 class LinuxStatxStructure(ctypes.Structure):
@@ -423,9 +584,21 @@ class LinuxStatxStructure(ctypes.Structure):
     ]
 
 
-_LINUX_C_LIBRARY = ctypes.CDLL(None, use_errno=True)
-_LINUX_STATX_FUNCTION = getattr(_LINUX_C_LIBRARY, "statx", None)
-_LINUX_RENAMEAT2_FUNCTION = getattr(_LINUX_C_LIBRARY, "renameat2", None)
+_LINUX_C_LIBRARY = (
+    ctypes.CDLL(None, use_errno=True) if sys.platform.startswith("linux") else None
+)
+_LINUX_STATX_FUNCTION = (
+    None if _LINUX_C_LIBRARY is None else getattr(_LINUX_C_LIBRARY, "statx", None)
+)
+_LINUX_RENAMEAT2_FUNCTION = (
+    None if _LINUX_C_LIBRARY is None else getattr(_LINUX_C_LIBRARY, "renameat2", None)
+)
+_LINUX_FACCESSAT_FUNCTION = (
+    None if _LINUX_C_LIBRARY is None else getattr(_LINUX_C_LIBRARY, "faccessat", None)
+)
+_LINUX_SYSCALL_FUNCTION = (
+    None if _LINUX_C_LIBRARY is None else getattr(_LINUX_C_LIBRARY, "syscall", None)
+)
 if _LINUX_STATX_FUNCTION is not None:
     _LINUX_STATX_FUNCTION.argtypes = [
         ctypes.c_int,
@@ -444,6 +617,99 @@ if _LINUX_RENAMEAT2_FUNCTION is not None:
         ctypes.c_uint,
     ]
     _LINUX_RENAMEAT2_FUNCTION.restype = ctypes.c_int
+if _LINUX_FACCESSAT_FUNCTION is not None:
+    _LINUX_FACCESSAT_FUNCTION.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _LINUX_FACCESSAT_FUNCTION.restype = ctypes.c_int
+if _LINUX_SYSCALL_FUNCTION is not None:
+    # syscall(2) is variadic.  Setting argtypes would incorrectly impose one
+    # signature on statx, renameat2, and faccessat2; every call below instead
+    # supplies explicitly sized ctypes arguments.
+    _LINUX_SYSCALL_FUNCTION.restype = ctypes.c_long
+
+
+def linux_syscall_number(syscall_name: str) -> int | None:
+    """Return a verified number for this process ABI, never a guessed value."""
+    process_pointer_size = ctypes.sizeof(ctypes.c_void_p)
+    if (
+        RUNNING_MACHINE_ARCHITECTURE in _LINUX_64_BIT_SYSCALL_ARCHITECTURES
+        and process_pointer_size != 8
+    ):
+        # uname reports the kernel architecture.  A compat or x32 process can
+        # use a different syscall table on that same kernel.
+        return None
+    if (
+        RUNNING_MACHINE_ARCHITECTURE in _LINUX_32_BIT_SYSCALL_ARCHITECTURES
+        and process_pointer_size != 4
+    ):
+        return None
+    architecture_numbers = _LINUX_SYSCALL_NUMBERS_BY_ARCHITECTURE.get(
+        RUNNING_MACHINE_ARCHITECTURE
+    )
+    if architecture_numbers is None:
+        return None
+    return architecture_numbers.get(syscall_name)
+
+
+def call_linux_statx(
+    directory_file_descriptor: int,
+    encoded_path: bytes,
+    lookup_flags: int,
+    requested_mask: int,
+    statx_record: LinuxStatxStructure,
+) -> int:
+    """Call libc statx when present, otherwise its verified raw syscall."""
+    if _LINUX_STATX_FUNCTION is not None:
+        return int(
+            _LINUX_STATX_FUNCTION(
+                directory_file_descriptor,
+                ctypes.c_char_p(encoded_path),
+                lookup_flags,
+                requested_mask,
+                ctypes.byref(statx_record),
+            )
+        )
+
+    syscall_number = linux_syscall_number("statx")
+    if _LINUX_SYSCALL_FUNCTION is None or syscall_number is None:
+        ctypes.set_errno(errno.ENOSYS)
+        return -1
+    return int(
+        _LINUX_SYSCALL_FUNCTION(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(directory_file_descriptor),
+            ctypes.c_char_p(encoded_path),
+            ctypes.c_int(lookup_flags),
+            ctypes.c_uint(requested_mask),
+            ctypes.byref(statx_record),
+        )
+    )
+
+
+def call_linux_faccessat2(
+    directory_file_descriptor: int,
+    encoded_path: bytes,
+    requested_access_mode: int,
+    lookup_flags: int,
+) -> int:
+    """Invoke faccessat2 through a verified raw-syscall ABI mapping."""
+    syscall_number = linux_syscall_number("faccessat2")
+    if _LINUX_SYSCALL_FUNCTION is None or syscall_number is None:
+        ctypes.set_errno(errno.ENOSYS)
+        return -1
+    return int(
+        _LINUX_SYSCALL_FUNCTION(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(directory_file_descriptor),
+            ctypes.c_char_p(encoded_path),
+            ctypes.c_int(requested_access_mode),
+            ctypes.c_int(lookup_flags),
+        )
+    )
 
 
 def rename_linux_directory_entry_with_flags(
@@ -454,24 +720,35 @@ def rename_linux_directory_entry_with_flags(
     rename_flags: int,
 ) -> None:
     """Conditionally rename entries relative to already-open directories."""
-    if _LINUX_RENAMEAT2_FUNCTION is None:
-        raise OSError(
-            errno.ENOSYS,
-            "the process C library does not expose Linux renameat2",
-        )
     encoded_source_entry_name = os.fsencode(source_entry_name)
     encoded_destination_entry_name = os.fsencode(destination_entry_name)
     if b"\0" in encoded_source_entry_name or b"\0" in encoded_destination_entry_name:
         raise ValueError("rename entry names must not contain embedded NUL bytes")
 
     ctypes.set_errno(0)
-    rename_return_code = _LINUX_RENAMEAT2_FUNCTION(
-        source_directory_file_descriptor,
-        ctypes.c_char_p(encoded_source_entry_name),
-        destination_directory_file_descriptor,
-        ctypes.c_char_p(encoded_destination_entry_name),
-        rename_flags,
-    )
+    if _LINUX_RENAMEAT2_FUNCTION is not None:
+        rename_return_code = _LINUX_RENAMEAT2_FUNCTION(
+            source_directory_file_descriptor,
+            ctypes.c_char_p(encoded_source_entry_name),
+            destination_directory_file_descriptor,
+            ctypes.c_char_p(encoded_destination_entry_name),
+            rename_flags,
+        )
+    else:
+        syscall_number = linux_syscall_number("renameat2")
+        if _LINUX_SYSCALL_FUNCTION is None or syscall_number is None:
+            raise OSError(
+                errno.ENOSYS,
+                "Linux renameat2 is unavailable for this process ABI",
+            )
+        rename_return_code = _LINUX_SYSCALL_FUNCTION(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(source_directory_file_descriptor),
+            ctypes.c_char_p(encoded_source_entry_name),
+            ctypes.c_int(destination_directory_file_descriptor),
+            ctypes.c_char_p(encoded_destination_entry_name),
+            ctypes.c_uint(rename_flags),
+        )
     if rename_return_code != 0:
         rename_errno = ctypes.get_errno()
         raise OSError(
@@ -519,8 +796,9 @@ def observe_linux_inode_attributes(
     path: str,
     *,
     follow_final_symbolic_link: bool,
+    file_descriptor: int | None = None,
 ) -> LinuxInodeAttributeEvidence:
-    """Observe immutable, append-only, and verity attributes without opening."""
+    """Observe mutation attributes by stable descriptor when one is available."""
     observed_statx_structure_size = ctypes.sizeof(LinuxStatxStructure)
     observed_attributes_offset = LinuxStatxStructure.stx_attributes.offset
     observed_attributes_mask_offset = LinuxStatxStructure.stx_attributes_mask.offset
@@ -552,21 +830,10 @@ def observe_linux_inode_attributes(
                 ),
             ),
         )
-    if _LINUX_STATX_FUNCTION is None:
-        return LinuxInodeAttributeEvidence(
-            immutable_attribute_is_set=None,
-            append_only_attribute_is_set=None,
-            verity_attribute_is_set=None,
-            uncertainty_reasons=(
-                EvidenceReason(
-                    "linux_statx_function_unavailable",
-                    evidence_source="process C library",
-                ),
-            ),
-        )
-
     try:
-        filesystem_encoded_path = os.fsencode(path)
+        filesystem_encoded_path = (
+            b"" if file_descriptor is not None else os.fsencode(path)
+        )
     except (TypeError, ValueError) as error:
         return LinuxInodeAttributeEvidence(
             immutable_attribute_is_set=None,
@@ -595,14 +862,21 @@ def observe_linux_inode_attributes(
         )
 
     statx_record = LinuxStatxStructure()
-    statx_lookup_flags = 0 if follow_final_symbolic_link else AT_SYMLINK_NOFOLLOW
+    statx_lookup_flags = (
+        AT_EMPTY_PATH
+        if file_descriptor is not None
+        else (0 if follow_final_symbolic_link else AT_SYMLINK_NOFOLLOW)
+    )
+    statx_directory_file_descriptor = (
+        file_descriptor if file_descriptor is not None else AT_FDCWD
+    )
     ctypes.set_errno(0)
-    statx_return_code = _LINUX_STATX_FUNCTION(
-        AT_FDCWD,
-        ctypes.c_char_p(filesystem_encoded_path),
+    statx_return_code = call_linux_statx(
+        statx_directory_file_descriptor,
+        filesystem_encoded_path,
         statx_lookup_flags,
         STATX_ALL,
-        ctypes.byref(statx_record),
+        statx_record,
     )
     if statx_return_code != 0:
         statx_errno = ctypes.get_errno()
@@ -612,7 +886,11 @@ def observe_linux_inode_attributes(
             verity_attribute_is_set=None,
             uncertainty_reasons=(
                 EvidenceReason(
-                    "linux_statx_failed",
+                    (
+                        "linux_statx_unavailable_for_process_abi"
+                        if statx_errno == errno.ENOSYS
+                        else "linux_statx_failed"
+                    ),
                     evidence_source="statx(2)",
                     operating_system_errno=statx_errno,
                     operating_system_message=os.strerror(statx_errno),
@@ -626,26 +904,17 @@ def observe_linux_inode_attributes(
             statx_record.stx_attributes & STATX_ATTR_IMMUTABLE
         )
     else:
-        immutable_attribute_is_set = None
-        uncertainty_reasons.append(
-            EvidenceReason(
-                "filesystem_did_not_report_immutable_attribute_support",
-                evidence_source="statx.stx_attributes_mask",
-            )
-        )
+        # stx_attributes_mask names attributes supported by both the VFS and
+        # filesystem.  An unsupported immutable bit cannot be set and is not an
+        # unknown state.
+        immutable_attribute_is_set = False
 
     if statx_record.stx_attributes_mask & STATX_ATTR_APPEND:
         append_only_attribute_is_set: bool | None = bool(
             statx_record.stx_attributes & STATX_ATTR_APPEND
         )
     else:
-        append_only_attribute_is_set = None
-        uncertainty_reasons.append(
-            EvidenceReason(
-                "filesystem_did_not_report_append_only_attribute_support",
-                evidence_source="statx.stx_attributes_mask",
-            )
-        )
+        append_only_attribute_is_set = False
 
     if statx_record.stx_attributes_mask & STATX_ATTR_VERITY:
         verity_attribute_is_set = bool(statx_record.stx_attributes & STATX_ATTR_VERITY)
@@ -916,6 +1185,8 @@ class KernelPathAccessEvidence:
 
     access_is_allowed: bool | None
     uncertainty_reason: EvidenceReason | None
+    operating_system_errno: int | None = None
+    evidence_source: str = "faccessat2(2)"
 
 
 def ask_kernel_about_path_access(
@@ -923,6 +1194,7 @@ def ask_kernel_about_path_access(
     requested_access_mode: int,
     *,
     process_credentials: LinuxProcessCredentialEvidence,
+    file_descriptor: int | None = None,
 ) -> KernelPathAccessEvidence:
     filesystem_identifiers = process_credentials.filesystem_identifiers
     if filesystem_identifiers.uncertainty_reason is not None:
@@ -942,7 +1214,7 @@ def ask_kernel_about_path_access(
                 "effective_id_access_query_cannot_model_distinct_filesystem_ids",
                 evidence_source=(
                     f"{LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH} and "
-                    "os.access(effective_ids=True)"
+                    "faccessat2(AT_EACCESS)"
                 ),
                 detail=(
                     f"effective_user_id={process_credentials.effective_user_id}; "
@@ -955,43 +1227,111 @@ def ask_kernel_about_path_access(
             ),
         )
 
-    effective_id_access_is_supported = os.access in os.supports_effective_ids
-    if not effective_id_access_is_supported:
+    try:
+        encoded_path = b"" if file_descriptor is not None else os.fsencode(path)
+    except (TypeError, ValueError) as error:
         return KernelPathAccessEvidence(
             access_is_allowed=None,
             uncertainty_reason=EvidenceReason(
-                "effective_id_access_check_is_not_supported",
-                evidence_source="os.supports_effective_ids",
+                "path_cannot_be_encoded_for_faccessat2",
+                evidence_source="os.fsencode",
+                detail=str(error),
+            ),
+        )
+    if b"\0" in encoded_path:
+        return KernelPathAccessEvidence(
+            access_is_allowed=None,
+            uncertainty_reason=EvidenceReason(
+                "path_contains_embedded_nul",
+                evidence_source="os.fsencode",
             ),
         )
 
-    try:
-        access_is_allowed = os.access(
-            path,
-            requested_access_mode,
-            effective_ids=True,
+    lookup_flags = AT_EACCESS
+    directory_file_descriptor = AT_FDCWD
+    if file_descriptor is not None:
+        lookup_flags |= AT_EMPTY_PATH
+        directory_file_descriptor = file_descriptor
+    ctypes.set_errno(0)
+    access_return_code = call_linux_faccessat2(
+        directory_file_descriptor,
+        encoded_path,
+        requested_access_mode,
+        lookup_flags,
+    )
+    access_evidence_source = "faccessat2(2)"
+    access_errno = 0 if access_return_code == 0 else ctypes.get_errno()
+    matching_real_and_effective_ids = (
+        process_credentials.real_user_id == process_credentials.effective_user_id
+        and process_credentials.real_group_id == process_credentials.effective_group_id
+    )
+    fallback_access_and_at_eaccess_semantics_are_equivalent = (
+        matching_real_and_effective_ids
+        and process_credentials.effective_user_id != 0
+        and process_credentials.effective_capabilities.capability_mask == 0
+        and process_credentials.effective_capabilities.uncertainty_reason is None
+    )
+    if (
+        access_return_code != 0
+        and access_errno == errno.ENOSYS
+        and fallback_access_and_at_eaccess_semantics_are_equivalent
+        and _LINUX_FACCESSAT_FUNCTION is not None
+    ):
+        fallback_encoded_path = (
+            os.fsencode(proc_path_for_file_descriptor(file_descriptor))
+            if file_descriptor is not None
+            else encoded_path
         )
-    except (OSError, TypeError, NotImplementedError) as error:
-        if isinstance(error, OSError):
-            uncertainty_reason = operating_system_error_reason(
-                "effective_id_access_check_failed",
-                error,
-                evidence_source="os.access",
-            )
-        else:
-            uncertainty_reason = EvidenceReason(
-                "effective_id_access_check_failed",
-                evidence_source="os.access",
-                detail=str(error),
-            )
+        ctypes.set_errno(0)
+        access_return_code = _LINUX_FACCESSAT_FUNCTION(
+            AT_FDCWD,
+            ctypes.c_char_p(fallback_encoded_path),
+            requested_access_mode,
+            0,
+        )
+        access_errno = 0 if access_return_code == 0 else ctypes.get_errno()
+        access_evidence_source = (
+            "faccessat(2) with matching real/effective/filesystem IDs, "
+            "non-root identity, and empty effective capability mask"
+        )
+    if access_return_code == 0:
         return KernelPathAccessEvidence(
-            access_is_allowed=None,
-            uncertainty_reason=uncertainty_reason,
+            access_is_allowed=True,
+            uncertainty_reason=None,
+            evidence_source=access_evidence_source,
         )
 
+    if access_errno in {errno.EACCES, errno.EPERM}:
+        return KernelPathAccessEvidence(
+            access_is_allowed=False,
+            uncertainty_reason=None,
+            operating_system_errno=access_errno,
+            evidence_source=access_evidence_source,
+        )
+
+    if access_errno == errno.ENOSYS:
+        reason_code = (
+            "linux_faccessat2_unavailable_and_faccessat_semantics_are_not_equivalent"
+            if _LINUX_FACCESSAT_FUNCTION is not None
+            and not fallback_access_and_at_eaccess_semantics_are_equivalent
+            else "linux_faccessat2_unavailable_for_process_abi_or_kernel"
+        )
+    else:
+        reason_code = (
+            "access_check_observed_read_only_filesystem"
+            if access_errno == errno.EROFS
+            else "effective_id_access_check_failed"
+        )
     return KernelPathAccessEvidence(
-        access_is_allowed=access_is_allowed,
-        uncertainty_reason=None,
+        access_is_allowed=None,
+        uncertainty_reason=EvidenceReason(
+            reason_code,
+            evidence_source=access_evidence_source,
+            operating_system_errno=access_errno,
+            operating_system_message=os.strerror(access_errno),
+        ),
+        operating_system_errno=access_errno,
+        evidence_source=access_evidence_source,
     )
 
 
@@ -1016,6 +1356,143 @@ def lexically_normalize_absolute_path(path: str) -> str:
         if linux_single_rooted_path == "/"
         else linux_single_rooted_path.rstrip("/")
     )
+
+
+def absolute_path_without_lexical_normalization(path: str) -> str:
+    """Make a path absolute while retaining kernel-significant dot components."""
+    if not isinstance(path, str):
+        raise TypeError(f"path must be str, received {type(path).__name__}")
+    if path == "":
+        raise ValueError("path must not be empty")
+    if "\0" in path:
+        raise ValueError("path must not contain an embedded NUL byte")
+    if path.startswith("/"):
+        return "/" + path.lstrip("/")
+    current_directory = os.getcwd()
+    if current_directory == "/":
+        return "/" + path
+    return current_directory.rstrip("/") + "/" + path
+
+
+@dataclass(frozen=True)
+class RequestedPathComponents:
+    """Final-component split that preserves the kernel's parent walk."""
+
+    absolute_path_with_dot_components: str
+    parent_path_with_dot_components: str
+    final_component: str
+    trailing_separator_requires_directory: bool
+
+    @property
+    def final_component_is_dot_or_dot_dot(self) -> bool:
+        return self.final_component in {".", ".."}
+
+
+def split_requested_path_without_normalizing(path: str) -> RequestedPathComponents:
+    absolute_path = absolute_path_without_lexical_normalization(path)
+    trailing_separator_requires_directory = (
+        absolute_path != "/" and absolute_path.endswith("/")
+    )
+    path_without_trailing_separators = absolute_path.rstrip("/") or "/"
+    if path_without_trailing_separators == "/":
+        return RequestedPathComponents(
+            absolute_path_with_dot_components=absolute_path,
+            parent_path_with_dot_components="/",
+            final_component=".",
+            trailing_separator_requires_directory=True,
+        )
+    parent_path, separator, final_component = (
+        path_without_trailing_separators.rpartition("/")
+    )
+    if not separator or not final_component:
+        raise ValueError("absolute path has no final component")
+    return RequestedPathComponents(
+        absolute_path_with_dot_components=absolute_path,
+        parent_path_with_dot_components=parent_path or "/",
+        final_component=final_component,
+        trailing_separator_requires_directory=trailing_separator_requires_directory,
+    )
+
+
+def proc_path_for_file_descriptor(file_descriptor: int) -> str:
+    return f"/proc/self/fd/{file_descriptor}"
+
+
+def observe_canonical_path_for_file_descriptor(
+    file_descriptor: int,
+    *,
+    fallback_path: str,
+) -> tuple[str, EvidenceReason | None]:
+    """Read the kernel's resolved pathname for a captured object descriptor."""
+    descriptor_link_path = proc_path_for_file_descriptor(file_descriptor)
+    try:
+        observed_path = os.readlink(descriptor_link_path)
+        if not observed_path.startswith("/"):
+            raise ValueError("descriptor link target is not absolute")
+        if observed_path.endswith(" (deleted)"):
+            return (
+                fallback_path,
+                EvidenceReason(
+                    "captured_path_was_unlinked_before_display_path_observation",
+                    evidence_source=descriptor_link_path,
+                    detail=observed_path,
+                ),
+            )
+        return lexically_normalize_absolute_path(observed_path), None
+    except (OSError, ValueError) as error:
+        if isinstance(error, OSError):
+            reason = operating_system_error_reason(
+                "cannot_observe_canonical_path_from_file_descriptor",
+                error,
+                evidence_source=descriptor_link_path,
+            )
+        else:
+            reason = EvidenceReason(
+                "cannot_observe_canonical_path_from_file_descriptor",
+                evidence_source=descriptor_link_path,
+                detail=str(error),
+            )
+        return fallback_path, reason
+
+
+def observe_canonical_existing_directory(
+    path: str,
+    *,
+    failure_reason_code: str,
+    evidence_source: str,
+) -> tuple[str | None, EvidenceReason | None]:
+    """Resolve a directory with kernel component semantics and a stable FD."""
+    requested_absolute_path = absolute_path_without_lexical_normalization(path)
+    directory_file_descriptor: int | None = None
+    try:
+        directory_file_descriptor = os.open(
+            requested_absolute_path,
+            getattr(os, "O_PATH", 0o10000000)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        canonical_path, canonical_path_note = (
+            observe_canonical_path_for_file_descriptor(
+                directory_file_descriptor,
+                fallback_path=requested_absolute_path,
+            )
+        )
+        if canonical_path_note is not None:
+            return None, canonical_path_note
+        return canonical_path, None
+    except OSError as error:
+        return (
+            None,
+            operating_system_error_reason(
+                failure_reason_code,
+                error,
+                evidence_source=evidence_source,
+            ),
+        )
+    finally:
+        if directory_file_descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(directory_file_descriptor)
 
 
 @dataclass(frozen=True)
@@ -1181,23 +1658,69 @@ class PathExclusionRule:
 def path_exclusion_rule_from_user_argument(
     unnormalized_path: str,
 ) -> PathExclusionRule:
-    normalized_path = lexically_normalize_absolute_path(unnormalized_path)
-    if unnormalized_path.endswith(os.sep):
-        includes_descendants = True
-        classification_uncertainty_reason = None
-    else:
-        try:
-            includes_descendants = stat.S_ISDIR(os.lstat(normalized_path).st_mode)
-            classification_uncertainty_reason = None
-        except OSError as error:
-            includes_descendants = False
-            classification_uncertainty_reason = operating_system_error_reason(
-                "cannot_determine_whether_exclusion_is_directory",
-                error,
-                evidence_source="os.lstat",
+    requested_path = split_requested_path_without_normalizing(unnormalized_path)
+    normalized_path = requested_path.absolute_path_with_dot_components
+    includes_descendants = requested_path.trailing_separator_requires_directory
+    classification_uncertainty_reason: EvidenceReason | None = None
+    parent_file_descriptor: int | None = None
+    object_file_descriptor: int | None = None
+    try:
+        parent_file_descriptor = os.open(
+            requested_path.parent_path_with_dot_components,
+            getattr(os, "O_PATH", 0o10000000)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        canonical_parent_path, parent_path_note = (
+            observe_canonical_path_for_file_descriptor(
+                parent_file_descriptor,
+                fallback_path=requested_path.parent_path_with_dot_components,
             )
+        )
+        object_lookup_name = requested_path.final_component
+        if requested_path.trailing_separator_requires_directory:
+            object_lookup_name += "/"
+        object_file_descriptor = os.open(
+            object_lookup_name,
+            getattr(os, "O_PATH", 0o10000000)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_file_descriptor,
+        )
+        object_metadata = os.fstat(object_file_descriptor)
+        normalized_path, object_path_note = observe_canonical_path_for_file_descriptor(
+            object_file_descriptor,
+            fallback_path=os.path.join(
+                canonical_parent_path,
+                requested_path.final_component,
+            ),
+        )
+        includes_descendants |= stat.S_ISDIR(object_metadata.st_mode)
+        classification_uncertainty_reason = object_path_note or parent_path_note
+    except OSError as error:
+        if parent_file_descriptor is not None:
+            canonical_parent_path, _ = observe_canonical_path_for_file_descriptor(
+                parent_file_descriptor,
+                fallback_path=requested_path.parent_path_with_dot_components,
+            )
+            normalized_path = os.path.join(
+                canonical_parent_path,
+                requested_path.final_component,
+            )
+        classification_uncertainty_reason = operating_system_error_reason(
+            "cannot_determine_whether_exclusion_is_directory",
+            error,
+            evidence_source="openat/fstat",
+        )
+    finally:
+        if object_file_descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(object_file_descriptor)
+        if parent_file_descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(parent_file_descriptor)
     return PathExclusionRule(
-        excluded_path=normalized_path,
+        excluded_path=lexically_normalize_absolute_path(normalized_path),
         includes_descendants=includes_descendants,
         rule_origin="user --exclude argument",
         classification_uncertainty_reason=(classification_uncertainty_reason),
@@ -1323,8 +1846,13 @@ def discover_process_related_home_directories(
     ) in candidate_sources_by_reported_path.items():
         joined_candidate_sources = ", ".join(candidate_sources)
         try:
-            normalized_home_directory_path = lexically_normalize_absolute_path(
-                reported_home_directory_path
+            (
+                normalized_home_directory_path,
+                directory_resolution_uncertainty,
+            ) = observe_canonical_existing_directory(
+                reported_home_directory_path,
+                failure_reason_code="home_directory_candidate_cannot_be_resolved",
+                evidence_source=joined_candidate_sources,
             )
         except (OSError, TypeError, ValueError) as error:
             uncertainty_reasons.append(
@@ -1335,6 +1863,17 @@ def discover_process_related_home_directories(
                         f"reported_home_directory_path="
                         f"{reported_home_directory_path!r}; error={error}"
                     ),
+                )
+            )
+            continue
+        if directory_resolution_uncertainty is not None:
+            uncertainty_reasons.append(directory_resolution_uncertainty)
+            continue
+        if normalized_home_directory_path is None:
+            uncertainty_reasons.append(
+                EvidenceReason(
+                    "home_directory_candidate_resolution_returned_no_path",
+                    evidence_source=joined_candidate_sources,
                 )
             )
             continue
@@ -1396,7 +1935,7 @@ def discover_active_writable_temporary_directory(
                 environment_value,
                 [],
             ).append(f"{environment_variable_name} environment variable")
-    candidate_sources_by_path.setdefault("/tmp", []).append(
+    candidate_sources_by_path.setdefault("/tmp", []).append(  # nosec B108
         "conventional Linux /tmp path"
     )
 
@@ -1406,9 +1945,12 @@ def discover_active_writable_temporary_directory(
     ) in candidate_sources_by_path.items():
         joined_candidate_sources = ", ".join(candidate_sources)
         try:
-            candidate_path = lexically_normalize_absolute_path(unnormalized_candidate)
+            requested_candidate_path = absolute_path_without_lexical_normalization(
+                unnormalized_candidate
+            )
+            candidate_path = lexically_normalize_absolute_path(requested_candidate_path)
             normalized_candidate_paths.append(candidate_path)
-            candidate_metadata = os.stat(candidate_path)
+            candidate_metadata = os.stat(requested_candidate_path)
         except OSError as error:
             uncertainty_reasons.append(
                 operating_system_error_reason(
@@ -1440,6 +1982,37 @@ def discover_active_writable_temporary_directory(
             candidate_observations.append(
                 EvidenceReason(
                     "temporary_directory_candidate_is_not_a_directory",
+                    evidence_source=joined_candidate_sources,
+                    detail=candidate_path,
+                )
+            )
+            continue
+
+        candidate_path, directory_resolution_uncertainty = (
+            observe_canonical_existing_directory(
+                requested_candidate_path,
+                failure_reason_code=(
+                    "temporary_directory_candidate_cannot_be_resolved"
+                ),
+                evidence_source=joined_candidate_sources,
+            )
+        )
+        if directory_resolution_uncertainty is not None:
+            uncertainty_reasons.append(directory_resolution_uncertainty)
+            continue
+        if candidate_path is None:
+            uncertainty_reasons.append(
+                EvidenceReason(
+                    "temporary_directory_candidate_resolution_returned_no_path",
+                    evidence_source=joined_candidate_sources,
+                )
+            )
+            continue
+        normalized_candidate_paths[-1] = candidate_path
+        if candidate_path == "/":
+            candidate_observations.append(
+                EvidenceReason(
+                    "temporary_directory_candidate_is_filesystem_root",
                     evidence_source=joined_candidate_sources,
                     detail=candidate_path,
                 )
@@ -1483,7 +2056,7 @@ def discover_active_writable_temporary_directory(
                 access_evidence.uncertainty_reason
                 or EvidenceReason(
                     "temporary_directory_access_evidence_is_missing",
-                    evidence_source="os.access",
+                    evidence_source="faccessat2(2)",
                 )
             )
     return TemporaryDirectoryDiscoveryEvidence(
@@ -1812,6 +2385,9 @@ class VisibleLinuxMountTable:
                 "visible mount topology requires at least one mount record"
             )
         validate_linux_mount_record_graph(self.mount_records)
+        self.mount_record_by_id = {
+            mount_record.mount_id: mount_record for mount_record in self.mount_records
+        }
         self.mount_records_by_parent_id: dict[int, list[LinuxMountRecord]] = {}
         for mount_record in self.mount_records:
             self.mount_records_by_parent_id.setdefault(
@@ -1985,6 +2561,64 @@ class VisibleLinuxMountTable:
                 deduplicate_preserving_first_occurrence(lookup_uncertainties)
             ),
             resolved_path_used_for_lookup=resolved_path,
+        )
+
+    def lookup_mount_for_file_descriptor(
+        self,
+        file_descriptor: int,
+        *,
+        fallback_path: str,
+    ) -> MountLookupEvidence:
+        """Identify the descriptor's mount directly from proc fdinfo."""
+        fdinfo_path = f"/proc/self/fdinfo/{file_descriptor}"
+        try:
+            descriptor_mount_id: int | None = None
+            with open(fdinfo_path, encoding="ascii", errors="strict") as fdinfo_stream:
+                for fdinfo_line in fdinfo_stream:
+                    if not fdinfo_line.startswith("mnt_id:"):
+                        continue
+                    mount_id_fields = fdinfo_line.split()
+                    if len(mount_id_fields) != 2:
+                        raise ValueError("mnt_id field has an unexpected shape")
+                    descriptor_mount_id = int(mount_id_fields[1], 10)
+                    break
+            if descriptor_mount_id is None:
+                raise ValueError("mnt_id field is missing")
+            descriptor_mount_record = self.mount_record_by_id.get(descriptor_mount_id)
+            if descriptor_mount_record is None:
+                raise ValueError(
+                    f"mount ID {descriptor_mount_id} is absent from the captured mount table"
+                )
+        except (OSError, UnicodeError, ValueError) as error:
+            fallback_lookup = self.lookup_mount_for_path(fallback_path)
+            if isinstance(error, OSError):
+                descriptor_reason = operating_system_error_reason(
+                    "cannot_observe_descriptor_mount_id",
+                    error,
+                    evidence_source=fdinfo_path,
+                )
+            else:
+                descriptor_reason = EvidenceReason(
+                    "cannot_parse_descriptor_mount_id",
+                    evidence_source=fdinfo_path,
+                    detail=str(error),
+                )
+            return MountLookupEvidence(
+                mount_record=fallback_lookup.mount_record,
+                uncertainty_reasons=tuple(
+                    deduplicate_preserving_first_occurrence(
+                        (*fallback_lookup.uncertainty_reasons, descriptor_reason)
+                    )
+                ),
+                resolved_path_used_for_lookup=(
+                    fallback_lookup.resolved_path_used_for_lookup
+                ),
+            )
+
+        return MountLookupEvidence(
+            mount_record=descriptor_mount_record,
+            uncertainty_reasons=self.uncertainty_reasons,
+            resolved_path_used_for_lookup=fallback_path,
         )
 
     def observe_path_is_visible_mountpoint(
@@ -2223,7 +2857,51 @@ class StructuredPathAuditRecord:
         self,
         *,
         serialized_audit_run_provenance: Mapping[str, object],
+        include_routine_uncertainty: bool,
     ) -> dict[str, object]:
+        uncertainty_grade_by_capability = {
+            capability_name: uncertainty_grade_for_reason_sequence(reasons)
+            for capability_name, reasons in (
+                self.capabilities_with_insufficient_evidence.items()
+            )
+        }
+        visible_uncertain_capabilities = {
+            capability_name: reasons
+            for capability_name, reasons in (
+                self.capabilities_with_insufficient_evidence.items()
+            )
+            if include_routine_uncertainty
+            or uncertainty_grade_by_capability[capability_name]
+            == UNCERTAINTY_GRADE_MATERIAL
+        }
+        omitted_routine_reasons = {
+            reason
+            for capability_name, reasons in (
+                self.capabilities_with_insufficient_evidence.items()
+            )
+            if capability_name not in visible_uncertain_capabilities
+            for reason in reasons
+        }
+        visible_blocked_capabilities = {
+            capability_name: tuple(
+                reason
+                for reason in reasons
+                if include_routine_uncertainty
+                or evidence_reason_uncertainty_grade(reason)
+                != UNCERTAINTY_GRADE_ROUTINE
+            )
+            for capability_name, reasons in self.model_blocked_capabilities.items()
+        }
+        visible_skipped_capabilities = {
+            capability_name: tuple(
+                reason
+                for reason in reasons
+                if include_routine_uncertainty
+                or evidence_reason_uncertainty_grade(reason)
+                != UNCERTAINTY_GRADE_ROUTINE
+            )
+            for capability_name, reasons in self.skipped_capabilities.items()
+        }
         serialized_record: dict[str, object] = {
             "record_schema_id": STRUCTURED_RECORD_SCHEMA_ID,
             "record_type": "filesystem_path_capability_assessment",
@@ -2238,25 +2916,38 @@ class StructuredPathAuditRecord:
                 else self.audited_path_lstat_metadata.as_serializable_dictionary()
             ),
             "model_indicated_capabilities": list(self.model_indicated_capabilities),
-            "capabilities_with_insufficient_evidence": (
-                serialize_capability_reason_mapping(
-                    self.capabilities_with_insufficient_evidence
-                )
-            ),
             "model_blocked_capabilities": (
-                serialize_capability_reason_mapping(self.model_blocked_capabilities)
+                serialize_capability_reason_mapping(visible_blocked_capabilities)
             ),
             "skipped_capabilities": serialize_capability_reason_mapping(
-                self.skipped_capabilities
+                visible_skipped_capabilities
             ),
             "capability_evidence_reasons": [
                 reason.as_serializable_dictionary()
                 for reason in self.capability_evidence_reasons
+                if reason not in omitted_routine_reasons
+                and (
+                    include_routine_uncertainty
+                    or evidence_reason_uncertainty_grade(reason)
+                    != UNCERTAINTY_GRADE_ROUTINE
+                )
             ],
             "observation_notes": [
-                reason.as_serializable_dictionary() for reason in self.observation_notes
+                reason.as_serializable_dictionary()
+                for reason in self.observation_notes
+                if include_routine_uncertainty
+                or evidence_reason_uncertainty_grade(reason)
+                != UNCERTAINTY_GRADE_ROUTINE
             ],
         }
+        if include_routine_uncertainty or visible_uncertain_capabilities:
+            serialized_record["capabilities_with_insufficient_evidence"] = (
+                serialize_capability_reason_mapping(visible_uncertain_capabilities)
+            )
+            serialized_record["uncertainty_grade_by_capability"] = {
+                capability_name: uncertainty_grade_by_capability[capability_name]
+                for capability_name in visible_uncertain_capabilities
+            }
         if self.resolved_symbolic_link_target_path is not None:
             serialized_record["resolved_symbolic_link_target_path"] = (
                 self.resolved_symbolic_link_target_path
@@ -2312,14 +3003,22 @@ def determine_path_model_status(
 
 @dataclass
 class DirectoryPostorderAssessmentState:
-    """Evidence retained until a directory is emitted after its children."""
+    """Constant-size state retained while one directory is streamed."""
 
     directory_path: str
+    directory_evidence_path: str
     directory_metadata: os.stat_result
     directory_identity: FilesystemObjectIdentity
+    directory_file_descriptor: int
+    parent_directory_file_descriptor: int
+    parent_directory_evidence_path: str
+    directory_entry_name: str
+    entry_lookup_followed_symbolic_link: bool
+    path_was_explicitly_requested: bool
+    directory_iterator: os.ScandirIterator | None
     parent_directory_state: DirectoryPostorderAssessmentState | None
     directory_listing_failure: EvidenceReason | None = None
-    directory_observation_notes: tuple[EvidenceReason, ...] = ()
+    directory_observation_notes: list[EvidenceReason] = field(default_factory=list)
     opened_directory_identity_matched_lstat: bool | None = None
     has_child_with_uncertain_delete_inference: bool = False
     has_child_with_blocked_or_skipped_delete_inference: bool = False
@@ -2327,9 +3026,22 @@ class DirectoryPostorderAssessmentState:
 
 @dataclass(frozen=True)
 class InspectPathTraversalInstruction:
-    path_to_inspect: str
+    audited_path: str
+    evidence_path: str
+    filesystem_metadata: os.stat_result
+    object_file_descriptor: int
+    parent_directory_file_descriptor: int
+    parent_directory_evidence_path: str
+    directory_entry_name: str
+    entry_lookup_followed_symbolic_link: bool
     path_was_explicitly_requested: bool
     parent_directory_state: DirectoryPostorderAssessmentState | None
+    observation_notes: tuple[EvidenceReason, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContinueDirectoryTraversalInstruction:
+    directory_state: DirectoryPostorderAssessmentState
 
 
 @dataclass(frozen=True)
@@ -2337,26 +3049,21 @@ class EmitDirectoryTraversalInstruction:
     directory_state: DirectoryPostorderAssessmentState
 
 
+# ``type_a | type_b`` would be evaluated here despite postponed annotations;
+# typing.Union keeps this importable on the supported Python 3.9 floor.
 TraversalInstruction = Union[
     InspectPathTraversalInstruction,
+    ContinueDirectoryTraversalInstruction,
     EmitDirectoryTraversalInstruction,
 ]
 
 
 @dataclass(frozen=True)
 class OpenDirectoryForListingEvidence:
-    directory_file_descriptor: int
+    directory_iterator: os.ScandirIterator
     opened_directory_identity: FilesystemObjectIdentity
     noatime_was_used: bool
     observation_notes: tuple[EvidenceReason, ...]
-
-
-@dataclass(frozen=True)
-class DirectoryListingEvidence:
-    child_paths: tuple[str, ...]
-    listing_failure: EvidenceReason | None
-    observation_notes: tuple[EvidenceReason, ...]
-    opened_directory_identity_matched_lstat: bool | None = None
 
 
 @dataclass
@@ -2384,6 +3091,11 @@ class PathAssessmentEvidenceCache:
         tuple[str, int],
         KernelPathAccessEvidence,
     ] = field(default_factory=dict)
+    file_descriptor_by_path_and_follow_mode: dict[
+        tuple[str, bool],
+        int,
+    ] = field(default_factory=dict)
+    access_file_descriptor_by_path: dict[str, int] = field(default_factory=dict)
 
 
 class LinuxFilesystemMutationPermissionAuditor:
@@ -2414,11 +3126,14 @@ class LinuxFilesystemMutationPermissionAuditor:
         self,
         path: str,
         requested_access_mode: int,
+        *,
+        file_descriptor: int | None = None,
     ) -> KernelPathAccessEvidence:
         return ask_kernel_about_path_access(
             path,
             requested_access_mode,
             process_credentials=self.process_credentials,
+            file_descriptor=file_descriptor,
         )
 
     def _lookup_mount_within_path_assessment(
@@ -2438,13 +3153,22 @@ class LinuxFilesystemMutationPermissionAuditor:
             cache_key
         )
         if cached_evidence is None:
-            cached_evidence = self.mount_table.lookup_mount_for_path(
-                path,
-                follow_final_symbolic_link=follow_final_symbolic_link,
-                strict_path_resolution_cache=(
-                    evidence_cache.strict_path_resolution_by_path
-                ),
+            stable_file_descriptor = (
+                evidence_cache.file_descriptor_by_path_and_follow_mode.get(cache_key)
             )
+            if stable_file_descriptor is not None:
+                cached_evidence = self.mount_table.lookup_mount_for_file_descriptor(
+                    stable_file_descriptor,
+                    fallback_path=path,
+                )
+            else:
+                cached_evidence = self.mount_table.lookup_mount_for_path(
+                    path,
+                    follow_final_symbolic_link=follow_final_symbolic_link,
+                    strict_path_resolution_cache=(
+                        evidence_cache.strict_path_resolution_by_path
+                    ),
+                )
             evidence_cache.mount_lookup_by_path_and_follow_mode[cache_key] = (
                 cached_evidence
             )
@@ -2467,9 +3191,13 @@ class LinuxFilesystemMutationPermissionAuditor:
             cache_key
         )
         if cached_evidence is None:
+            stable_file_descriptor = (
+                evidence_cache.file_descriptor_by_path_and_follow_mode.get(cache_key)
+            )
             cached_evidence = observe_linux_inode_attributes(
                 path,
                 follow_final_symbolic_link=follow_final_symbolic_link,
+                file_descriptor=stable_file_descriptor,
             )
             evidence_cache.inode_attributes_by_path_and_follow_mode[cache_key] = (
                 cached_evidence
@@ -2488,10 +3216,20 @@ class LinuxFilesystemMutationPermissionAuditor:
         cache_key = (path, requested_access_mode)
         cached_evidence = evidence_cache.kernel_access_by_path_and_mode.get(cache_key)
         if cached_evidence is None:
-            cached_evidence = self.ask_kernel_about_access(
-                path,
-                requested_access_mode,
+            stable_file_descriptor = evidence_cache.access_file_descriptor_by_path.get(
+                path
             )
+            if stable_file_descriptor is None:
+                cached_evidence = self.ask_kernel_about_access(
+                    path,
+                    requested_access_mode,
+                )
+            else:
+                cached_evidence = self.ask_kernel_about_access(
+                    path,
+                    requested_access_mode,
+                    file_descriptor=stable_file_descriptor,
+                )
             evidence_cache.kernel_access_by_path_and_mode[cache_key] = cached_evidence
         return cached_evidence
 
@@ -2546,19 +3284,215 @@ class LinuxFilesystemMutationPermissionAuditor:
         *,
         selected_capabilities: Sequence[str],
     ) -> Iterator[PathCapabilityAssessment]:
-        normalized_starting_path = lexically_normalize_absolute_path(path)
+        requested_path = split_requested_path_without_normalizing(path)
         normalized_selected_capabilities = tuple(selected_capabilities)
         starting_filesystem_device_number: int | None = None
-        pending_instructions: list[TraversalInstruction] = [
-            InspectPathTraversalInstruction(
-                path_to_inspect=normalized_starting_path,
-                path_was_explicitly_requested=True,
-                parent_directory_state=None,
-            )
-        ]
+        pending_instructions: list[TraversalInstruction] = []
         active_directory_identities: set[FilesystemObjectIdentity] = set()
+        owned_file_descriptors: set[int] = set()
+        open_directory_iterators: list[os.ScandirIterator] = []
+
+        parent_open_flags = getattr(os, "O_PATH", 0o10000000)
+        parent_open_flags |= getattr(os, "O_CLOEXEC", 0)
+        parent_open_flags |= getattr(os, "O_DIRECTORY", 0)
+        object_open_flags = getattr(os, "O_PATH", 0o10000000)
+        object_open_flags |= getattr(os, "O_CLOEXEC", 0)
+        object_open_flags |= getattr(os, "O_NOFOLLOW", 0)
 
         try:
+            try:
+                root_parent_file_descriptor = os.open(
+                    requested_path.parent_path_with_dot_components,
+                    parent_open_flags,
+                )
+                owned_file_descriptors.add(root_parent_file_descriptor)
+            except OSError as error:
+                unavailable_assessment = self._same_verdict_for_all_capabilities(
+                    filesystem_object_kind=(
+                        FILESYSTEM_OBJECT_KIND_MISSING
+                        if error.errno == errno.ENOENT
+                        else FILESYSTEM_OBJECT_KIND_UNOBSERVED
+                    ),
+                    audited_path=requested_path.absolute_path_with_dot_components,
+                    selected_capabilities=normalized_selected_capabilities,
+                    model_verdict=(
+                        MODEL_VERDICT_INDICATES_BLOCKED
+                        if error.errno in {errno.ENOENT, errno.ENOTDIR}
+                        else MODEL_VERDICT_INSUFFICIENT_EVIDENCE
+                    ),
+                    evidence_reasons=(
+                        operating_system_error_reason(
+                            "cannot_open_requested_path_parent_directory",
+                            error,
+                            evidence_source="openat(O_PATH|O_DIRECTORY)",
+                        ),
+                    ),
+                )
+                yield unavailable_assessment
+                return
+
+            parent_display_path, parent_display_note = (
+                observe_canonical_path_for_file_descriptor(
+                    root_parent_file_descriptor,
+                    fallback_path=requested_path.parent_path_with_dot_components,
+                )
+            )
+            root_lookup_name = requested_path.final_component
+            if requested_path.trailing_separator_requires_directory:
+                root_lookup_name += "/"
+            try:
+                root_object_file_descriptor = os.open(
+                    root_lookup_name,
+                    object_open_flags,
+                    dir_fd=root_parent_file_descriptor,
+                )
+                owned_file_descriptors.add(root_object_file_descriptor)
+                root_metadata = os.fstat(root_object_file_descriptor)
+            except FileNotFoundError:
+                existing_final_entry_metadata: os.stat_result | None = None
+                if requested_path.trailing_separator_requires_directory:
+                    with contextlib.suppress(OSError):
+                        existing_final_entry_metadata = os.stat(
+                            requested_path.final_component,
+                            dir_fd=root_parent_file_descriptor,
+                            follow_symlinks=False,
+                        )
+                if existing_final_entry_metadata is not None:
+                    unresolved_target_assessment = self._same_verdict_for_all_capabilities(
+                        filesystem_object_kind=classify_filesystem_object_kind(
+                            existing_final_entry_metadata
+                        ),
+                        audited_path=(requested_path.absolute_path_with_dot_components),
+                        selected_capabilities=normalized_selected_capabilities,
+                        model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
+                        evidence_reasons=(
+                            EvidenceReason(
+                                "trailing_separator_target_cannot_be_resolved_as_directory",
+                                evidence_source="openat(O_PATH|O_NOFOLLOW)",
+                                operating_system_errno=errno.ENOENT,
+                                operating_system_message=os.strerror(errno.ENOENT),
+                            ),
+                        ),
+                        audited_path_lstat_metadata=(
+                            ObservedLinuxFilesystemObjectMetadata.from_stat_result(
+                                existing_final_entry_metadata
+                            )
+                        ),
+                    )
+                    yield unresolved_target_assessment
+                    return
+                missing_display_path = (
+                    parent_display_path
+                    if requested_path.final_component == "."
+                    else os.path.join(
+                        parent_display_path,
+                        requested_path.final_component,
+                    )
+                )
+                missing_assessment = self.assess_explicitly_requested_missing_path(
+                    missing_display_path,
+                    normalized_selected_capabilities,
+                    parent_directory_path=proc_path_for_file_descriptor(
+                        root_parent_file_descriptor
+                    ),
+                    parent_directory_metadata=os.fstat(root_parent_file_descriptor),
+                    parent_directory_file_descriptor=root_parent_file_descriptor,
+                )
+                try:
+                    os.stat(
+                        requested_path.final_component,
+                        dir_fd=root_parent_file_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    missing_assessment = self._assessment_with_identity_instability(
+                        missing_assessment,
+                        normalized_selected_capabilities,
+                        operating_system_error_reason(
+                            "cannot_revalidate_requested_missing_path",
+                            error,
+                            evidence_source="fstatat(2)",
+                        ),
+                    )
+                else:
+                    missing_assessment = self._assessment_with_identity_instability(
+                        missing_assessment,
+                        normalized_selected_capabilities,
+                        EvidenceReason(
+                            "requested_missing_path_appeared_during_assessment",
+                            evidence_source="fstatat(2)",
+                        ),
+                    )
+                yield missing_assessment
+                return
+            except NotADirectoryError as error:
+                invalid_assessment = self._same_verdict_for_all_capabilities(
+                    filesystem_object_kind=FILESYSTEM_OBJECT_KIND_UNOBSERVED,
+                    audited_path=requested_path.absolute_path_with_dot_components,
+                    selected_capabilities=normalized_selected_capabilities,
+                    model_verdict=MODEL_VERDICT_INDICATES_BLOCKED,
+                    evidence_reasons=(
+                        operating_system_error_reason(
+                            "requested_path_component_is_not_a_directory",
+                            error,
+                            evidence_source="openat(O_PATH)",
+                        ),
+                    ),
+                )
+                yield invalid_assessment
+                return
+            except OSError as error:
+                unavailable_assessment = self._same_verdict_for_all_capabilities(
+                    filesystem_object_kind=FILESYSTEM_OBJECT_KIND_UNOBSERVED,
+                    audited_path=requested_path.absolute_path_with_dot_components,
+                    selected_capabilities=normalized_selected_capabilities,
+                    model_verdict=MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                    evidence_reasons=(
+                        operating_system_error_reason(
+                            "cannot_capture_requested_path",
+                            error,
+                            evidence_source="openat(O_PATH|O_NOFOLLOW)",
+                        ),
+                    ),
+                )
+                yield unavailable_assessment
+                return
+
+            root_display_path, root_display_note = (
+                observe_canonical_path_for_file_descriptor(
+                    root_object_file_descriptor,
+                    fallback_path=requested_path.absolute_path_with_dot_components,
+                )
+            )
+            root_observation_notes = tuple(
+                reason
+                for reason in (parent_display_note, root_display_note)
+                if reason is not None
+            )
+            pending_instructions.append(
+                InspectPathTraversalInstruction(
+                    audited_path=root_display_path,
+                    evidence_path=proc_path_for_file_descriptor(
+                        root_object_file_descriptor
+                    ),
+                    filesystem_metadata=root_metadata,
+                    object_file_descriptor=root_object_file_descriptor,
+                    parent_directory_file_descriptor=root_parent_file_descriptor,
+                    parent_directory_evidence_path=proc_path_for_file_descriptor(
+                        root_parent_file_descriptor
+                    ),
+                    directory_entry_name=requested_path.final_component,
+                    entry_lookup_followed_symbolic_link=(
+                        requested_path.trailing_separator_requires_directory
+                    ),
+                    path_was_explicitly_requested=True,
+                    parent_directory_state=None,
+                    observation_notes=root_observation_notes,
+                )
+            )
+
             while pending_instructions:
                 current_instruction = pending_instructions.pop()
                 if isinstance(
@@ -2566,10 +3500,27 @@ class LinuxFilesystemMutationPermissionAuditor:
                     EmitDirectoryTraversalInstruction,
                 ):
                     directory_state = current_instruction.directory_state
+                    evidence_cache = self._captured_object_evidence_cache(
+                        evidence_path=directory_state.directory_evidence_path,
+                        object_file_descriptor=(
+                            directory_state.directory_file_descriptor
+                        ),
+                        parent_directory_evidence_path=(
+                            directory_state.parent_directory_evidence_path
+                        ),
+                        parent_directory_file_descriptor=(
+                            directory_state.parent_directory_file_descriptor
+                        ),
+                    )
                     directory_assessment = self.assess_directory(
-                        directory_state.directory_path,
+                        directory_state.directory_evidence_path,
                         directory_state.directory_metadata,
                         normalized_selected_capabilities,
+                        audited_path=directory_state.directory_path,
+                        parent_directory_path=(
+                            directory_state.parent_directory_evidence_path
+                        ),
+                        evidence_cache=evidence_cache,
                         has_uncertain_descendant_delete=(
                             directory_state.has_child_with_uncertain_delete_inference
                         ),
@@ -2579,11 +3530,42 @@ class LinuxFilesystemMutationPermissionAuditor:
                         directory_listing_failure=(
                             directory_state.directory_listing_failure
                         ),
-                        observation_notes=(directory_state.directory_observation_notes),
+                        observation_notes=tuple(
+                            deduplicate_preserving_first_occurrence(
+                                directory_state.directory_observation_notes
+                            )
+                        ),
                         directory_identity_matched_lstat=(
                             directory_state.opened_directory_identity_matched_lstat
                         ),
                     )
+                    if (
+                        directory_state.path_was_explicitly_requested
+                        and directory_state.directory_entry_name in {".", ".."}
+                    ):
+                        directory_assessment = (
+                            self._assessment_with_unremovable_dot_component(
+                                directory_assessment
+                            )
+                        )
+                    identity_instability = self._entry_identity_instability_reason(
+                        parent_directory_file_descriptor=(
+                            directory_state.parent_directory_file_descriptor
+                        ),
+                        directory_entry_name=directory_state.directory_entry_name,
+                        expected_identity=directory_state.directory_identity,
+                        follow_symbolic_link=(
+                            directory_state.entry_lookup_followed_symbolic_link
+                        ),
+                    )
+                    if identity_instability is not None:
+                        directory_assessment = (
+                            self._assessment_with_identity_instability(
+                                directory_assessment,
+                                normalized_selected_capabilities,
+                                identity_instability,
+                            )
+                        )
                     active_directory_identities.discard(
                         directory_state.directory_identity
                     )
@@ -2591,11 +3573,165 @@ class LinuxFilesystemMutationPermissionAuditor:
                         directory_state.parent_directory_state,
                         directory_assessment,
                     )
+                    self._close_owned_file_descriptor(
+                        directory_state.directory_file_descriptor,
+                        owned_file_descriptors,
+                    )
                     yield directory_assessment
                     continue
 
-                current_path = lexically_normalize_absolute_path(
-                    current_instruction.path_to_inspect
+                if isinstance(
+                    current_instruction,
+                    ContinueDirectoryTraversalInstruction,
+                ):
+                    directory_state = current_instruction.directory_state
+                    directory_iterator = directory_state.directory_iterator
+                    if directory_iterator is None:
+                        pending_instructions.append(
+                            EmitDirectoryTraversalInstruction(directory_state)
+                        )
+                        continue
+                    try:
+                        directory_entry = next(directory_iterator)
+                    except StopIteration:
+                        self._close_directory_iterator(
+                            directory_state,
+                            open_directory_iterators,
+                        )
+                        pending_instructions.append(
+                            EmitDirectoryTraversalInstruction(directory_state)
+                        )
+                        continue
+                    except OSError as error:
+                        directory_state.directory_listing_failure = (
+                            operating_system_error_reason(
+                                "cannot_continue_directory_listing",
+                                error,
+                                evidence_source="os.scandir",
+                            )
+                        )
+                        self._close_directory_iterator(
+                            directory_state,
+                            open_directory_iterators,
+                        )
+                        pending_instructions.append(
+                            EmitDirectoryTraversalInstruction(directory_state)
+                        )
+                        continue
+
+                    child_file_descriptor: int | None = None
+                    try:
+                        child_file_descriptor = os.open(
+                            directory_entry.name,
+                            object_open_flags,
+                            dir_fd=directory_state.directory_file_descriptor,
+                        )
+                        owned_file_descriptors.add(child_file_descriptor)
+                        child_metadata = os.fstat(child_file_descriptor)
+                    except OSError as error:
+                        if child_file_descriptor is not None:
+                            self._close_owned_file_descriptor(
+                                child_file_descriptor,
+                                owned_file_descriptors,
+                            )
+                        if error.errno in {errno.EMFILE, errno.ENFILE}:
+                            directory_state.directory_listing_failure = operating_system_error_reason(
+                                "directory_traversal_file_descriptor_budget_exhausted",
+                                error,
+                                evidence_source="openat(O_PATH|O_NOFOLLOW)",
+                            )
+                            self._close_directory_iterator(
+                                directory_state,
+                                open_directory_iterators,
+                            )
+                            pending_instructions.append(
+                                EmitDirectoryTraversalInstruction(directory_state)
+                            )
+                            continue
+
+                        pending_instructions.append(
+                            ContinueDirectoryTraversalInstruction(directory_state)
+                        )
+                        child_path = os.path.join(
+                            directory_state.directory_path,
+                            directory_entry.name,
+                        )
+                        child_failure_assessment = (
+                            self._same_verdict_for_all_capabilities(
+                                filesystem_object_kind=(
+                                    FILESYSTEM_OBJECT_KIND_MISSING
+                                    if error.errno == errno.ENOENT
+                                    else FILESYSTEM_OBJECT_KIND_UNOBSERVED
+                                ),
+                                audited_path=child_path,
+                                selected_capabilities=(
+                                    normalized_selected_capabilities
+                                ),
+                                model_verdict=MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                                evidence_reasons=(
+                                    operating_system_error_reason(
+                                        (
+                                            "path_disappeared_during_directory_scan"
+                                            if error.errno == errno.ENOENT
+                                            else "cannot_capture_directory_entry"
+                                        ),
+                                        error,
+                                        evidence_source=("openat(O_PATH|O_NOFOLLOW)"),
+                                    ),
+                                ),
+                            )
+                        )
+                        self._record_direct_child_delete_inference(
+                            directory_state,
+                            child_failure_assessment,
+                        )
+                        yield child_failure_assessment
+                        continue
+
+                    pending_instructions.append(
+                        ContinueDirectoryTraversalInstruction(directory_state)
+                    )
+                    child_fallback_path = os.path.join(
+                        directory_state.directory_path,
+                        directory_entry.name,
+                    )
+                    child_display_path, child_display_note = (
+                        observe_canonical_path_for_file_descriptor(
+                            child_file_descriptor,
+                            fallback_path=child_fallback_path,
+                        )
+                    )
+                    pending_instructions.append(
+                        InspectPathTraversalInstruction(
+                            audited_path=child_display_path,
+                            evidence_path=proc_path_for_file_descriptor(
+                                child_file_descriptor
+                            ),
+                            filesystem_metadata=child_metadata,
+                            object_file_descriptor=child_file_descriptor,
+                            parent_directory_file_descriptor=(
+                                directory_state.directory_file_descriptor
+                            ),
+                            parent_directory_evidence_path=(
+                                directory_state.directory_evidence_path
+                            ),
+                            directory_entry_name=directory_entry.name,
+                            entry_lookup_followed_symbolic_link=False,
+                            path_was_explicitly_requested=False,
+                            parent_directory_state=directory_state,
+                            observation_notes=(
+                                ()
+                                if child_display_note is None
+                                else (child_display_note,)
+                            ),
+                        )
+                    )
+                    continue
+
+                current_path = current_instruction.audited_path
+                current_metadata = current_instruction.filesystem_metadata
+                current_identity = FilesystemObjectIdentity.from_stat_result(
+                    current_metadata
                 )
                 if current_path in self.internally_ignored_paths:
                     ignored_report_artifact_assessment = (
@@ -2616,81 +3752,38 @@ class LinuxFilesystemMutationPermissionAuditor:
                         current_instruction.parent_directory_state,
                         ignored_report_artifact_assessment,
                     )
+                    self._close_owned_file_descriptor(
+                        current_instruction.object_file_descriptor,
+                        owned_file_descriptors,
+                    )
                     continue
 
                 terminal_assessment = self._assessment_if_excluded(
                     current_path,
                     normalized_selected_capabilities,
+                    filesystem_metadata=current_metadata,
                 )
                 if terminal_assessment is not None:
                     self._record_direct_child_delete_inference(
                         current_instruction.parent_directory_state,
                         terminal_assessment,
                     )
+                    self._close_owned_file_descriptor(
+                        current_instruction.object_file_descriptor,
+                        owned_file_descriptors,
+                    )
                     yield terminal_assessment
                     continue
 
-                try:
-                    path_metadata = os.lstat(current_path)
-                except FileNotFoundError:
-                    if current_instruction.path_was_explicitly_requested:
-                        missing_assessment = (
-                            self.assess_explicitly_requested_missing_path(
-                                current_path,
-                                normalized_selected_capabilities,
-                            )
-                        )
-                    else:
-                        missing_assessment = self._same_verdict_for_all_capabilities(
-                            filesystem_object_kind=(FILESYSTEM_OBJECT_KIND_MISSING),
-                            audited_path=current_path,
-                            selected_capabilities=(normalized_selected_capabilities),
-                            model_verdict=(MODEL_VERDICT_INSUFFICIENT_EVIDENCE),
-                            evidence_reasons=(
-                                EvidenceReason(
-                                    "path_disappeared_during_directory_scan",
-                                    evidence_source="os.lstat",
-                                ),
-                            ),
-                            audited_path_lstat_metadata=None,
-                        )
-                    self._record_direct_child_delete_inference(
-                        current_instruction.parent_directory_state,
-                        missing_assessment,
-                    )
-                    yield missing_assessment
-                    continue
-                except OSError as error:
-                    metadata_failure_assessment = (
-                        self._same_verdict_for_all_capabilities(
-                            filesystem_object_kind=(FILESYSTEM_OBJECT_KIND_UNOBSERVED),
-                            audited_path=current_path,
-                            selected_capabilities=(normalized_selected_capabilities),
-                            model_verdict=(MODEL_VERDICT_INSUFFICIENT_EVIDENCE),
-                            evidence_reasons=(
-                                operating_system_error_reason(
-                                    "cannot_observe_path_metadata",
-                                    error,
-                                    evidence_source="os.lstat",
-                                ),
-                            ),
-                            audited_path_lstat_metadata=None,
-                        )
-                    )
-                    self._record_direct_child_delete_inference(
-                        current_instruction.parent_directory_state,
-                        metadata_failure_assessment,
-                    )
-                    yield metadata_failure_assessment
-                    continue
-
-                filesystem_object_kind = classify_filesystem_object_kind(path_metadata)
+                filesystem_object_kind = classify_filesystem_object_kind(
+                    current_metadata
+                )
                 if current_instruction.path_was_explicitly_requested:
-                    starting_filesystem_device_number = path_metadata.st_dev
+                    starting_filesystem_device_number = current_metadata.st_dev
                 if (
                     self.remain_on_starting_filesystem
                     and starting_filesystem_device_number is not None
-                    and path_metadata.st_dev != starting_filesystem_device_number
+                    and current_metadata.st_dev != starting_filesystem_device_number
                 ):
                     different_filesystem_assessment = (
                         self._same_verdict_for_all_capabilities(
@@ -2706,7 +3799,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                                         "starting_device="
                                         f"{starting_filesystem_device_number};"
                                         " observed_device="
-                                        f"{path_metadata.st_dev}"
+                                        f"{current_metadata.st_dev}"
                                     ),
                                 ),
                             ),
@@ -2716,26 +3809,83 @@ class LinuxFilesystemMutationPermissionAuditor:
                         current_instruction.parent_directory_state,
                         different_filesystem_assessment,
                     )
+                    self._close_owned_file_descriptor(
+                        current_instruction.object_file_descriptor,
+                        owned_file_descriptors,
+                    )
                     yield different_filesystem_assessment
                     continue
 
                 if filesystem_object_kind != FILESYSTEM_OBJECT_KIND_DIRECTORY:
+                    evidence_cache = self._captured_object_evidence_cache(
+                        evidence_path=current_instruction.evidence_path,
+                        object_file_descriptor=(
+                            current_instruction.object_file_descriptor
+                        ),
+                        parent_directory_evidence_path=(
+                            current_instruction.parent_directory_evidence_path
+                        ),
+                        parent_directory_file_descriptor=(
+                            current_instruction.parent_directory_file_descriptor
+                        ),
+                    )
                     leaf_assessment = self.assess_non_directory_path(
-                        current_path,
-                        path_metadata,
+                        current_instruction.evidence_path,
+                        current_metadata,
                         filesystem_object_kind,
                         normalized_selected_capabilities,
+                        audited_path=current_path,
+                        parent_directory_path=(
+                            current_instruction.parent_directory_evidence_path
+                        ),
+                        parent_directory_file_descriptor=(
+                            current_instruction.parent_directory_file_descriptor
+                        ),
+                        directory_entry_name=(current_instruction.directory_entry_name),
+                        evidence_cache=evidence_cache,
                     )
+                    if current_instruction.observation_notes:
+                        leaf_assessment = self._assessment_with_observation_notes(
+                            leaf_assessment,
+                            current_instruction.observation_notes,
+                        )
+                    if (
+                        current_instruction.path_was_explicitly_requested
+                        and current_instruction.directory_entry_name in {".", ".."}
+                    ):
+                        leaf_assessment = (
+                            self._assessment_with_unremovable_dot_component(
+                                leaf_assessment
+                            )
+                        )
+                    identity_instability = self._entry_identity_instability_reason(
+                        parent_directory_file_descriptor=(
+                            current_instruction.parent_directory_file_descriptor
+                        ),
+                        directory_entry_name=(current_instruction.directory_entry_name),
+                        expected_identity=current_identity,
+                        follow_symbolic_link=(
+                            current_instruction.entry_lookup_followed_symbolic_link
+                        ),
+                    )
+                    if identity_instability is not None:
+                        leaf_assessment = self._assessment_with_identity_instability(
+                            leaf_assessment,
+                            normalized_selected_capabilities,
+                            identity_instability,
+                        )
                     self._record_direct_child_delete_inference(
                         current_instruction.parent_directory_state,
                         leaf_assessment,
                     )
+                    self._close_owned_file_descriptor(
+                        current_instruction.object_file_descriptor,
+                        owned_file_descriptors,
+                    )
                     yield leaf_assessment
                     continue
 
-                directory_identity = FilesystemObjectIdentity.from_stat_result(
-                    path_metadata
-                )
+                directory_identity = current_identity
                 if directory_identity in active_directory_identities:
                     repeated_directory_assessment = (
                         self._same_verdict_for_all_capabilities(
@@ -2759,38 +3909,297 @@ class LinuxFilesystemMutationPermissionAuditor:
                         current_instruction.parent_directory_state,
                         repeated_directory_assessment,
                     )
+                    self._close_owned_file_descriptor(
+                        current_instruction.object_file_descriptor,
+                        owned_file_descriptors,
+                    )
                     yield repeated_directory_assessment
                     continue
 
-                directory_listing = self._read_directory_child_paths(
-                    current_path,
-                    expected_directory_identity=directory_identity,
-                )
+                try:
+                    opened_directory = self._open_directory_for_listing(
+                        current_instruction.object_file_descriptor,
+                    )
+                    directory_iterator = opened_directory.directory_iterator
+                    open_directory_iterators.append(directory_iterator)
+                    directory_observation_notes = [
+                        *current_instruction.observation_notes,
+                        *opened_directory.observation_notes,
+                    ]
+                    if opened_directory.noatime_was_used:
+                        directory_observation_notes.append(
+                            EvidenceReason(
+                                "directory_was_opened_with_o_noatime",
+                                evidence_source="openat(O_NOATIME)",
+                            )
+                        )
+                    directory_identity_matched = (
+                        opened_directory.opened_directory_identity == directory_identity
+                    )
+                    directory_listing_failure = (
+                        None
+                        if directory_identity_matched
+                        else EvidenceReason(
+                            "directory_identity_changed_between_capture_and_listing",
+                            evidence_source="fstat st_dev/st_ino",
+                        )
+                    )
+                    if not directory_identity_matched:
+                        with contextlib.suppress(OSError):
+                            directory_iterator.close()
+                        open_directory_iterators.remove(directory_iterator)
+                        directory_iterator = None
+                except OSError as error:
+                    directory_iterator = None
+                    directory_identity_matched = None
+                    directory_observation_notes = list(
+                        current_instruction.observation_notes
+                    )
+                    directory_listing_failure = operating_system_error_reason(
+                        "cannot_list_directory",
+                        error,
+                        evidence_source="openat/os.scandir",
+                    )
+
                 directory_state = DirectoryPostorderAssessmentState(
                     directory_path=current_path,
-                    directory_metadata=path_metadata,
+                    directory_evidence_path=current_instruction.evidence_path,
+                    directory_metadata=current_metadata,
                     directory_identity=directory_identity,
+                    directory_file_descriptor=(
+                        current_instruction.object_file_descriptor
+                    ),
+                    parent_directory_file_descriptor=(
+                        current_instruction.parent_directory_file_descriptor
+                    ),
+                    parent_directory_evidence_path=(
+                        current_instruction.parent_directory_evidence_path
+                    ),
+                    directory_entry_name=current_instruction.directory_entry_name,
+                    entry_lookup_followed_symbolic_link=(
+                        current_instruction.entry_lookup_followed_symbolic_link
+                    ),
+                    path_was_explicitly_requested=(
+                        current_instruction.path_was_explicitly_requested
+                    ),
+                    directory_iterator=directory_iterator,
                     parent_directory_state=(current_instruction.parent_directory_state),
-                    directory_listing_failure=(directory_listing.listing_failure),
-                    directory_observation_notes=(directory_listing.observation_notes),
+                    directory_listing_failure=directory_listing_failure,
+                    directory_observation_notes=directory_observation_notes,
                     opened_directory_identity_matched_lstat=(
-                        directory_listing.opened_directory_identity_matched_lstat
+                        directory_identity_matched
                     ),
                 )
                 active_directory_identities.add(directory_identity)
-                pending_instructions.append(
-                    EmitDirectoryTraversalInstruction(directory_state)
-                )
-                for child_path in reversed(directory_listing.child_paths):
+                if directory_iterator is None:
                     pending_instructions.append(
-                        InspectPathTraversalInstruction(
-                            path_to_inspect=child_path,
-                            path_was_explicitly_requested=False,
-                            parent_directory_state=directory_state,
-                        )
+                        EmitDirectoryTraversalInstruction(directory_state)
+                    )
+                else:
+                    pending_instructions.append(
+                        ContinueDirectoryTraversalInstruction(directory_state)
                     )
         finally:
+            for directory_iterator in reversed(open_directory_iterators):
+                with contextlib.suppress(OSError):
+                    directory_iterator.close()
+            for file_descriptor in tuple(owned_file_descriptors):
+                with contextlib.suppress(OSError):
+                    os.close(file_descriptor)
             active_directory_identities.clear()
+
+    @staticmethod
+    def _captured_object_evidence_cache(
+        *,
+        evidence_path: str,
+        object_file_descriptor: int,
+        parent_directory_evidence_path: str,
+        parent_directory_file_descriptor: int,
+    ) -> PathAssessmentEvidenceCache:
+        return PathAssessmentEvidenceCache(
+            file_descriptor_by_path_and_follow_mode={
+                (evidence_path, False): object_file_descriptor,
+                (evidence_path, True): object_file_descriptor,
+                (parent_directory_evidence_path, False): (
+                    parent_directory_file_descriptor
+                ),
+                (parent_directory_evidence_path, True): (
+                    parent_directory_file_descriptor
+                ),
+            },
+            access_file_descriptor_by_path={
+                evidence_path: object_file_descriptor,
+                parent_directory_evidence_path: parent_directory_file_descriptor,
+            },
+        )
+
+    @staticmethod
+    def _close_owned_file_descriptor(
+        file_descriptor: int,
+        owned_file_descriptors: set[int],
+    ) -> None:
+        if file_descriptor not in owned_file_descriptors:
+            return
+        os.close(file_descriptor)
+        owned_file_descriptors.remove(file_descriptor)
+
+    @staticmethod
+    def _close_directory_iterator(
+        directory_state: DirectoryPostorderAssessmentState,
+        open_directory_iterators: list[os.ScandirIterator],
+    ) -> None:
+        directory_iterator = directory_state.directory_iterator
+        if directory_iterator is None:
+            return
+        try:
+            directory_iterator.close()
+        except OSError as error:
+            close_reason = operating_system_error_reason(
+                "cannot_close_directory_iterator",
+                error,
+                evidence_source="os.ScandirIterator.close",
+            )
+            if directory_state.directory_listing_failure is None:
+                directory_state.directory_listing_failure = close_reason
+            else:
+                directory_state.directory_observation_notes.append(close_reason)
+        finally:
+            directory_state.directory_iterator = None
+            with contextlib.suppress(ValueError):
+                open_directory_iterators.remove(directory_iterator)
+
+    @staticmethod
+    def _entry_identity_instability_reason(
+        *,
+        parent_directory_file_descriptor: int,
+        directory_entry_name: str,
+        expected_identity: FilesystemObjectIdentity,
+        follow_symbolic_link: bool,
+    ) -> EvidenceReason | None:
+        try:
+            current_metadata = os.stat(
+                directory_entry_name,
+                dir_fd=parent_directory_file_descriptor,
+                follow_symlinks=follow_symbolic_link,
+            )
+        except OSError as error:
+            return operating_system_error_reason(
+                "directory_entry_changed_after_descriptor_capture",
+                error,
+                evidence_source="fstatat(2)",
+            )
+        current_identity = FilesystemObjectIdentity.from_stat_result(current_metadata)
+        if current_identity == expected_identity:
+            return None
+        return EvidenceReason(
+            "directory_entry_identity_changed_after_descriptor_capture",
+            evidence_source="fstat/fstatat st_dev/st_ino",
+            detail=f"captured={expected_identity}; current={current_identity}",
+        )
+
+    @staticmethod
+    def _assessment_with_observation_notes(
+        assessment: PathCapabilityAssessment,
+        additional_notes: Iterable[EvidenceReason],
+    ) -> PathCapabilityAssessment:
+        return PathCapabilityAssessment(
+            filesystem_object_kind=assessment.filesystem_object_kind,
+            audited_path=assessment.audited_path,
+            inference_by_capability_name=assessment.inference_by_capability_name,
+            assessment_completed_at_utc=assessment.assessment_completed_at_utc,
+            observation_notes=tuple(
+                deduplicate_preserving_first_occurrence(
+                    (*assessment.observation_notes, *tuple(additional_notes))
+                )
+            ),
+            audited_path_lstat_metadata=assessment.audited_path_lstat_metadata,
+            resolved_symbolic_link_target_path=(
+                assessment.resolved_symbolic_link_target_path
+            ),
+            resolved_symbolic_link_target_kind=(
+                assessment.resolved_symbolic_link_target_kind
+            ),
+            resolved_symbolic_link_target_stat_metadata=(
+                assessment.resolved_symbolic_link_target_stat_metadata
+            ),
+        )
+
+    @classmethod
+    def _assessment_with_identity_instability(
+        cls,
+        assessment: PathCapabilityAssessment,
+        selected_capabilities: Sequence[str],
+        instability_reason: EvidenceReason,
+    ) -> PathCapabilityAssessment:
+        uncertain_inferences = {
+            capability_name: capability_inference(
+                capability_name,
+                MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                (
+                    *assessment.inference_for_capability(
+                        capability_name
+                    ).evidence_reasons,
+                    instability_reason,
+                ),
+            )
+            for capability_name in selected_capabilities
+        }
+        return PathCapabilityAssessment(
+            filesystem_object_kind=assessment.filesystem_object_kind,
+            audited_path=assessment.audited_path,
+            inference_by_capability_name=uncertain_inferences,
+            assessment_completed_at_utc=assessment.assessment_completed_at_utc,
+            observation_notes=assessment.observation_notes,
+            audited_path_lstat_metadata=assessment.audited_path_lstat_metadata,
+            resolved_symbolic_link_target_path=(
+                assessment.resolved_symbolic_link_target_path
+            ),
+            resolved_symbolic_link_target_kind=(
+                assessment.resolved_symbolic_link_target_kind
+            ),
+            resolved_symbolic_link_target_stat_metadata=(
+                assessment.resolved_symbolic_link_target_stat_metadata
+            ),
+        )
+
+    @staticmethod
+    def _assessment_with_unremovable_dot_component(
+        assessment: PathCapabilityAssessment,
+    ) -> PathCapabilityAssessment:
+        delete_inference = assessment.inference_by_capability_name.get(
+            CAPABILITY_DELETE_ENTRY_OR_TREE
+        )
+        if delete_inference is None:
+            return assessment
+        updated_inferences = dict(assessment.inference_by_capability_name)
+        updated_inferences[CAPABILITY_DELETE_ENTRY_OR_TREE] = capability_inference(
+            CAPABILITY_DELETE_ENTRY_OR_TREE,
+            MODEL_VERDICT_INDICATES_BLOCKED,
+            (
+                *delete_inference.evidence_reasons,
+                EvidenceReason(
+                    "requested_final_dot_component_cannot_be_removed",
+                    evidence_source="unlinkat(2)/rmdir(2) pathname semantics",
+                ),
+            ),
+        )
+        return PathCapabilityAssessment(
+            filesystem_object_kind=assessment.filesystem_object_kind,
+            audited_path=assessment.audited_path,
+            inference_by_capability_name=updated_inferences,
+            assessment_completed_at_utc=assessment.assessment_completed_at_utc,
+            observation_notes=assessment.observation_notes,
+            audited_path_lstat_metadata=assessment.audited_path_lstat_metadata,
+            resolved_symbolic_link_target_path=(
+                assessment.resolved_symbolic_link_target_path
+            ),
+            resolved_symbolic_link_target_kind=(
+                assessment.resolved_symbolic_link_target_kind
+            ),
+            resolved_symbolic_link_target_stat_metadata=(
+                assessment.resolved_symbolic_link_target_stat_metadata
+            ),
+        )
 
     @staticmethod
     def _record_direct_child_delete_inference(
@@ -2816,7 +4225,7 @@ class LinuxFilesystemMutationPermissionAuditor:
 
     @staticmethod
     def _open_directory_for_listing(
-        directory_path: str,
+        directory_file_descriptor: int,
     ) -> OpenDirectoryForListingEvidence:
         directory_open_flags = os.O_RDONLY
         directory_open_flags |= getattr(os, "O_CLOEXEC", 0)
@@ -2826,21 +4235,24 @@ class LinuxFilesystemMutationPermissionAuditor:
 
         if noatime_open_flag:
             try:
-                directory_file_descriptor = os.open(
-                    directory_path,
+                readable_directory_file_descriptor = os.open(
+                    ".",
                     directory_open_flags | noatime_open_flag,
+                    dir_fd=directory_file_descriptor,
                 )
                 try:
                     opened_directory_identity = (
                         FilesystemObjectIdentity.from_stat_result(
-                            os.fstat(directory_file_descriptor)
+                            os.fstat(readable_directory_file_descriptor)
                         )
                     )
-                except OSError:
-                    os.close(directory_file_descriptor)
+                    directory_iterator = os.scandir(readable_directory_file_descriptor)
+                except BaseException:
+                    os.close(readable_directory_file_descriptor)
                     raise
+                os.close(readable_directory_file_descriptor)
                 return OpenDirectoryForListingEvidence(
-                    directory_file_descriptor=directory_file_descriptor,
+                    directory_iterator=directory_iterator,
                     opened_directory_identity=opened_directory_identity,
                     noatime_was_used=True,
                     observation_notes=(),
@@ -2866,127 +4278,41 @@ class LinuxFilesystemMutationPermissionAuditor:
                 evidence_source="os.O_NOATIME",
             )
 
-        directory_file_descriptor = os.open(
-            directory_path,
+        readable_directory_file_descriptor = os.open(
+            ".",
             directory_open_flags,
+            dir_fd=directory_file_descriptor,
         )
         try:
             opened_directory_identity = FilesystemObjectIdentity.from_stat_result(
-                os.fstat(directory_file_descriptor)
+                os.fstat(readable_directory_file_descriptor)
             )
-        except OSError:
-            os.close(directory_file_descriptor)
+            directory_iterator = os.scandir(readable_directory_file_descriptor)
+        except BaseException:
+            os.close(readable_directory_file_descriptor)
             raise
+        os.close(readable_directory_file_descriptor)
         return OpenDirectoryForListingEvidence(
-            directory_file_descriptor=directory_file_descriptor,
+            directory_iterator=directory_iterator,
             opened_directory_identity=opened_directory_identity,
             noatime_was_used=False,
             observation_notes=(noatime_fallback_reason,),
-        )
-
-    def _read_directory_child_paths(
-        self,
-        directory_path: str,
-        *,
-        expected_directory_identity: FilesystemObjectIdentity,
-    ) -> DirectoryListingEvidence:
-        child_paths: list[str] = []
-        opened_directory: OpenDirectoryForListingEvidence | None = None
-        directory_iterator: os.ScandirIterator | None = None
-        listing_failure: EvidenceReason | None = None
-        observation_notes: list[EvidenceReason] = []
-        opened_directory_identity_matched_lstat: bool | None = None
-
-        try:
-            opened_directory = self._open_directory_for_listing(directory_path)
-            observation_notes.extend(opened_directory.observation_notes)
-            if opened_directory.noatime_was_used:
-                observation_notes.append(
-                    EvidenceReason(
-                        "directory_was_opened_with_o_noatime",
-                        evidence_source="os.open(O_NOATIME)",
-                    )
-                )
-            if (
-                opened_directory.opened_directory_identity
-                != expected_directory_identity
-            ):
-                opened_directory_identity_matched_lstat = False
-                listing_failure = EvidenceReason(
-                    "directory_identity_changed_between_lstat_and_open",
-                    evidence_source="lstat/fstat st_dev/st_ino",
-                    detail=(
-                        "expected="
-                        f"{expected_directory_identity}; "
-                        "opened="
-                        f"{opened_directory.opened_directory_identity}"
-                    ),
-                )
-            else:
-                opened_directory_identity_matched_lstat = True
-                directory_iterator = os.scandir(
-                    opened_directory.directory_file_descriptor
-                )
-                for directory_entry in directory_iterator:
-                    child_paths.append(
-                        os.path.join(directory_path, directory_entry.name)
-                    )
-        except OSError as error:
-            listing_failure = operating_system_error_reason(
-                "cannot_list_directory",
-                error,
-                evidence_source="os.open/os.scandir",
-            )
-        except MemoryError:
-            listing_failure = EvidenceReason(
-                "cannot_list_directory_because_memory_was_exhausted",
-                evidence_source="directory traversal",
-            )
-        finally:
-            if directory_iterator is not None:
-                try:
-                    directory_iterator.close()
-                except OSError as error:
-                    close_reason = operating_system_error_reason(
-                        "cannot_close_directory_iterator",
-                        error,
-                        evidence_source="os.ScandirIterator.close",
-                    )
-                    if listing_failure is None:
-                        listing_failure = close_reason
-                    else:
-                        observation_notes.append(close_reason)
-            if opened_directory is not None:
-                try:
-                    os.close(opened_directory.directory_file_descriptor)
-                except OSError as error:
-                    observation_notes.append(
-                        operating_system_error_reason(
-                            "cannot_close_directory_file_descriptor",
-                            error,
-                            evidence_source="os.close",
-                        )
-                    )
-
-        return DirectoryListingEvidence(
-            child_paths=tuple(sorted(child_paths, key=os.fsencode)),
-            listing_failure=listing_failure,
-            observation_notes=tuple(
-                deduplicate_preserving_first_occurrence(observation_notes)
-            ),
-            opened_directory_identity_matched_lstat=(
-                opened_directory_identity_matched_lstat
-            ),
         )
 
     def _assessment_if_excluded(
         self,
         path: str,
         selected_capabilities: Sequence[str],
+        *,
+        filesystem_metadata: os.stat_result | None = None,
     ) -> PathCapabilityAssessment | None:
         if path_matches_any_exclusion_rule(path, self.exclusion_rules):
             try:
-                excluded_path_metadata = os.lstat(path)
+                excluded_path_metadata = (
+                    filesystem_metadata
+                    if filesystem_metadata is not None
+                    else os.lstat(path)
+                )
                 excluded_object_kind = classify_filesystem_object_kind(
                     excluded_path_metadata
                 )
@@ -3050,12 +4376,35 @@ class LinuxFilesystemMutationPermissionAuditor:
         self,
         missing_path: str,
         selected_capabilities: Sequence[str],
+        *,
+        parent_directory_path: str | None = None,
+        parent_directory_metadata: os.stat_result | None = None,
+        parent_directory_file_descriptor: int | None = None,
     ) -> PathCapabilityAssessment:
+        evidence_cache = PathAssessmentEvidenceCache()
+        if (
+            parent_directory_path is not None
+            and parent_directory_file_descriptor is not None
+        ):
+            evidence_cache.file_descriptor_by_path_and_follow_mode.update(
+                {
+                    (parent_directory_path, False): parent_directory_file_descriptor,
+                    (parent_directory_path, True): parent_directory_file_descriptor,
+                }
+            )
+            evidence_cache.access_file_descriptor_by_path[parent_directory_path] = (
+                parent_directory_file_descriptor
+            )
         inference_by_capability_name: dict[str, CapabilityModelInference] = {}
         for capability_name in selected_capabilities:
             if capability_name == CAPABILITY_CREATE_DIRECTORY_ENTRY:
                 inference_by_capability_name[capability_name] = (
-                    self.infer_create_explicit_missing_path(missing_path)
+                    self.infer_create_explicit_missing_path(
+                        missing_path,
+                        parent_directory_path=parent_directory_path,
+                        parent_directory_metadata=parent_directory_metadata,
+                        evidence_cache=evidence_cache,
+                    )
                 )
             else:
                 inference_by_capability_name[capability_name] = capability_inference(
@@ -3080,15 +4429,28 @@ class LinuxFilesystemMutationPermissionAuditor:
         path_metadata: os.stat_result,
         filesystem_object_kind: str,
         selected_capabilities: Sequence[str],
+        *,
+        audited_path: str | None = None,
+        parent_directory_path: str | None = None,
+        parent_directory_file_descriptor: int | None = None,
+        directory_entry_name: str | None = None,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> PathCapabilityAssessment:
+        displayed_path = path if audited_path is None else audited_path
         if filesystem_object_kind == FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK:
             return self.assess_symbolic_link(
                 path,
                 path_metadata,
                 selected_capabilities,
+                audited_path=displayed_path,
+                parent_directory_path=parent_directory_path,
+                parent_directory_file_descriptor=parent_directory_file_descriptor,
+                directory_entry_name=directory_entry_name,
+                evidence_cache=evidence_cache,
             )
 
-        evidence_cache = PathAssessmentEvidenceCache()
+        if evidence_cache is None:
+            evidence_cache = PathAssessmentEvidenceCache()
         inference_by_capability_name: dict[str, CapabilityModelInference] = {}
         for capability_name in selected_capabilities:
             if capability_name == CAPABILITY_DELETE_ENTRY_OR_TREE:
@@ -3100,6 +4462,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         has_blocked_descendant_delete=False,
                         directory_listing_failure=None,
                         evidence_cache=evidence_cache,
+                        parent_directory_path=parent_directory_path,
                     )
                 )
             elif capability_name == CAPABILITY_APPEND_REGULAR_FILE_CONTENT:
@@ -3109,6 +4472,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         filesystem_object_kind,
                         CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
                         evidence_cache=evidence_cache,
+                        target_metadata=path_metadata,
                     )
                 )
             elif capability_name == CAPABILITY_OVERWRITE_REGULAR_FILE_CONTENT:
@@ -3118,6 +4482,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         filesystem_object_kind,
                         CAPABILITY_OVERWRITE_REGULAR_FILE_CONTENT,
                         evidence_cache=evidence_cache,
+                        target_metadata=path_metadata,
                     )
                 )
             elif capability_name == CAPABILITY_CREATE_DIRECTORY_ENTRY:
@@ -3138,12 +4503,13 @@ class LinuxFilesystemMutationPermissionAuditor:
                         path,
                         filesystem_object_kind,
                         evidence_cache=evidence_cache,
+                        target_metadata=path_metadata,
                     )
                 )
 
         return PathCapabilityAssessment(
             filesystem_object_kind=filesystem_object_kind,
-            audited_path=path,
+            audited_path=displayed_path,
             inference_by_capability_name=inference_by_capability_name,
             audited_path_lstat_metadata=(
                 ObservedLinuxFilesystemObjectMetadata.from_stat_result(path_metadata)
@@ -3155,8 +4521,18 @@ class LinuxFilesystemMutationPermissionAuditor:
         symbolic_link_path: str,
         symbolic_link_metadata: os.stat_result,
         selected_capabilities: Sequence[str],
+        *,
+        audited_path: str | None = None,
+        parent_directory_path: str | None = None,
+        parent_directory_file_descriptor: int | None = None,
+        directory_entry_name: str | None = None,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> PathCapabilityAssessment:
-        evidence_cache = PathAssessmentEvidenceCache()
+        displayed_symbolic_link_path = (
+            symbolic_link_path if audited_path is None else audited_path
+        )
+        if evidence_cache is None:
+            evidence_cache = PathAssessmentEvidenceCache()
         inference_by_capability_name: dict[str, CapabilityModelInference] = {}
         resolved_target_path: str | None = None
         target_path_resolution_note: EvidenceReason | None = None
@@ -3169,14 +4545,66 @@ class LinuxFilesystemMutationPermissionAuditor:
             for capability_name in selected_capabilities
         )
         if target_following_capability_is_selected:
+            link_file_descriptor = (
+                evidence_cache.file_descriptor_by_path_and_follow_mode.get(
+                    (symbolic_link_path, False)
+                )
+            )
             (
                 resolved_target_path,
                 target_path_resolution_note,
             ) = self._observe_symbolic_link_target_path(
-                symbolic_link_path,
+                displayed_symbolic_link_path,
+                symbolic_link_file_descriptor=link_file_descriptor,
             )
+            target_file_descriptor: int | None = None
             try:
-                target_metadata = os.stat(symbolic_link_path)
+                if (
+                    parent_directory_file_descriptor is not None
+                    and directory_entry_name is not None
+                ):
+                    target_file_descriptor = os.open(
+                        directory_entry_name,
+                        getattr(os, "O_PATH", 0o10000000) | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=parent_directory_file_descriptor,
+                    )
+                    target_metadata = os.fstat(target_file_descriptor)
+                    (
+                        resolved_target_path,
+                        target_display_note,
+                    ) = observe_canonical_path_for_file_descriptor(
+                        target_file_descriptor,
+                        fallback_path=resolved_target_path
+                        or displayed_symbolic_link_path,
+                    )
+                    if target_display_note is not None:
+                        target_path_resolution_note = target_display_note
+                    evidence_cache.file_descriptor_by_path_and_follow_mode[
+                        (symbolic_link_path, True)
+                    ] = target_file_descriptor
+                    evidence_cache.access_file_descriptor_by_path[
+                        symbolic_link_path
+                    ] = target_file_descriptor
+                    # Capture every target query used by the selected
+                    # capabilities before closing this short-lived descriptor.
+                    self._observe_inode_attributes_within_path_assessment(
+                        symbolic_link_path,
+                        follow_final_symbolic_link=True,
+                        evidence_cache=evidence_cache,
+                    )
+                    self._lookup_mount_within_path_assessment(
+                        symbolic_link_path,
+                        follow_final_symbolic_link=True,
+                        evidence_cache=evidence_cache,
+                    )
+                    for access_mode in (os.W_OK, os.X_OK, os.W_OK | os.X_OK):
+                        self._ask_kernel_about_access_within_path_assessment(
+                            symbolic_link_path,
+                            access_mode,
+                            evidence_cache=evidence_cache,
+                        )
+                else:
+                    target_metadata = os.stat(symbolic_link_path)
                 target_kind = classify_filesystem_object_kind(target_metadata)
             except OSError as error:
                 target_stat_error = error
@@ -3184,6 +4612,17 @@ class LinuxFilesystemMutationPermissionAuditor:
                     target_kind = FILESYSTEM_OBJECT_KIND_MISSING
                 else:
                     target_kind = FILESYSTEM_OBJECT_KIND_UNOBSERVED
+            finally:
+                if target_file_descriptor is not None:
+                    os.close(target_file_descriptor)
+                    evidence_cache.file_descriptor_by_path_and_follow_mode.pop(
+                        (symbolic_link_path, True),
+                        None,
+                    )
+                    evidence_cache.access_file_descriptor_by_path.pop(
+                        symbolic_link_path,
+                        None,
+                    )
 
         for capability_name in selected_capabilities:
             if capability_name == CAPABILITY_DELETE_ENTRY_OR_TREE:
@@ -3195,6 +4634,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         has_blocked_descendant_delete=False,
                         directory_listing_failure=None,
                         evidence_cache=evidence_cache,
+                        parent_directory_path=parent_directory_path,
                     )
                 )
                 continue
@@ -3225,6 +4665,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                                 FILESYSTEM_OBJECT_KIND_REGULAR_FILE,
                                 CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
                                 evidence_cache=evidence_cache,
+                                target_metadata=target_metadata,
                             ),
                             (
                                 EvidenceReason(
@@ -3257,6 +4698,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                                 FILESYSTEM_OBJECT_KIND_REGULAR_FILE,
                                 CAPABILITY_OVERWRITE_REGULAR_FILE_CONTENT,
                                 evidence_cache=evidence_cache,
+                                target_metadata=target_metadata,
                             ),
                             (
                                 EvidenceReason(
@@ -3338,6 +4780,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                                 symbolic_link_path,
                                 target_kind,
                                 evidence_cache=evidence_cache,
+                                target_metadata=target_metadata,
                             ),
                             (
                                 EvidenceReason(
@@ -3364,7 +4807,7 @@ class LinuxFilesystemMutationPermissionAuditor:
 
         return PathCapabilityAssessment(
             filesystem_object_kind=FILESYSTEM_OBJECT_KIND_SYMBOLIC_LINK,
-            audited_path=symbolic_link_path,
+            audited_path=displayed_symbolic_link_path,
             inference_by_capability_name=inference_by_capability_name,
             observation_notes=(
                 ()
@@ -3390,9 +4833,15 @@ class LinuxFilesystemMutationPermissionAuditor:
     @staticmethod
     def _observe_symbolic_link_target_path(
         symbolic_link_path: str,
+        *,
+        symbolic_link_file_descriptor: int | None = None,
     ) -> tuple[str | None, EvidenceReason | None]:
         try:
-            raw_link_target = os.readlink(symbolic_link_path)
+            raw_link_target = (
+                os.readlink("", dir_fd=symbolic_link_file_descriptor)
+                if symbolic_link_file_descriptor is not None
+                else os.readlink(symbolic_link_path)
+            )
         except OSError as error:
             return (
                 None,
@@ -3449,12 +4898,30 @@ class LinuxFilesystemMutationPermissionAuditor:
         directory_metadata: os.stat_result,
         selected_capabilities: Sequence[str],
         *,
+        audited_path: str | None = None,
+        parent_directory_path: str | None = None,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
         has_uncertain_descendant_delete: bool,
         has_blocked_descendant_delete: bool,
         directory_listing_failure: EvidenceReason | None,
         observation_notes: Sequence[EvidenceReason],
         directory_identity_matched_lstat: bool | None,
     ) -> PathCapabilityAssessment:
+        displayed_directory_path = (
+            directory_path if audited_path is None else audited_path
+        )
+        complete_observation_notes = tuple(
+            deduplicate_preserving_first_occurrence(
+                (
+                    *observation_notes,
+                    *(
+                        ()
+                        if directory_listing_failure is None
+                        else (directory_listing_failure,)
+                    ),
+                )
+            )
+        )
         if directory_identity_matched_lstat is False:
             identity_change_reason = directory_listing_failure or EvidenceReason(
                 "directory_identity_changed_between_lstat_and_open",
@@ -3462,11 +4929,11 @@ class LinuxFilesystemMutationPermissionAuditor:
             )
             return self._same_verdict_for_all_capabilities(
                 filesystem_object_kind=FILESYSTEM_OBJECT_KIND_DIRECTORY,
-                audited_path=directory_path,
+                audited_path=displayed_directory_path,
                 selected_capabilities=selected_capabilities,
                 model_verdict=MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
                 evidence_reasons=(identity_change_reason,),
-                observation_notes=observation_notes,
+                observation_notes=complete_observation_notes,
                 audited_path_lstat_metadata=(
                     ObservedLinuxFilesystemObjectMetadata.from_stat_result(
                         directory_metadata
@@ -3474,7 +4941,8 @@ class LinuxFilesystemMutationPermissionAuditor:
                 ),
             )
 
-        evidence_cache = PathAssessmentEvidenceCache()
+        if evidence_cache is None:
+            evidence_cache = PathAssessmentEvidenceCache()
         inference_by_capability_name: dict[str, CapabilityModelInference] = {}
         for capability_name in selected_capabilities:
             if capability_name == CAPABILITY_DELETE_ENTRY_OR_TREE:
@@ -3488,6 +4956,7 @@ class LinuxFilesystemMutationPermissionAuditor:
                         has_blocked_descendant_delete=(has_blocked_descendant_delete),
                         directory_listing_failure=directory_listing_failure,
                         evidence_cache=evidence_cache,
+                        parent_directory_path=parent_directory_path,
                     )
                 )
             elif capability_name == CAPABILITY_CREATE_DIRECTORY_ENTRY:
@@ -3528,9 +4997,9 @@ class LinuxFilesystemMutationPermissionAuditor:
 
         return PathCapabilityAssessment(
             filesystem_object_kind=FILESYSTEM_OBJECT_KIND_DIRECTORY,
-            audited_path=directory_path,
+            audited_path=displayed_directory_path,
             inference_by_capability_name=inference_by_capability_name,
-            observation_notes=tuple(observation_notes),
+            observation_notes=complete_observation_notes,
             audited_path_lstat_metadata=(
                 ObservedLinuxFilesystemObjectMetadata.from_stat_result(
                     directory_metadata
@@ -3547,6 +5016,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         has_blocked_descendant_delete: bool,
         directory_listing_failure: EvidenceReason | None,
         evidence_cache: PathAssessmentEvidenceCache | None = None,
+        parent_directory_path: str | None = None,
     ) -> CapabilityModelInference:
         evidence_reasons: list[EvidenceReason] = []
         model_has_uncertain_evidence = False
@@ -3570,22 +5040,33 @@ class LinuxFilesystemMutationPermissionAuditor:
                 evidence_cache=evidence_cache,
             )
         )
-        if target_attribute_evidence.immutable_attribute_is_set is True:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "target_immutable_attribute_blocks_deletion",
-                    evidence_source="statx.stx_attributes",
+        for (
+            attribute_is_set,
+            blocking_reason_code,
+            clearable_reason_code,
+        ) in (
+            (
+                target_attribute_evidence.immutable_attribute_is_set,
+                "target_immutable_attribute_blocks_deletion",
+                "target_immutable_attribute_may_be_clearable_before_deletion",
+            ),
+            (
+                target_attribute_evidence.append_only_attribute_is_set,
+                "target_append_only_attribute_blocks_deletion",
+                "target_append_only_attribute_may_be_clearable_before_deletion",
+            ),
+        ):
+            attribute_reasons, attribute_uncertain, attribute_blocks = (
+                self._infer_set_inode_flag_constraint(
+                    attribute_is_set=attribute_is_set,
+                    inode_owner_user_id=target_metadata.st_uid,
+                    blocking_reason_code=blocking_reason_code,
+                    potentially_clearable_reason_code=clearable_reason_code,
                 )
             )
-            model_has_blocking_evidence = True
-        if target_attribute_evidence.append_only_attribute_is_set is True:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "target_append_only_attribute_blocks_deletion",
-                    evidence_source="statx.stx_attributes",
-                )
-            )
-            model_has_blocking_evidence = True
+            evidence_reasons.extend(attribute_reasons)
+            model_has_uncertain_evidence |= attribute_uncertain
+            model_has_blocking_evidence |= attribute_blocks
         if target_attribute_evidence.evidence_is_uncertain:
             evidence_reasons.extend(target_attribute_evidence.uncertainty_reasons)
             model_has_uncertain_evidence = True
@@ -3595,15 +5076,33 @@ class LinuxFilesystemMutationPermissionAuditor:
             follow_final_symbolic_link=False,
             evidence_cache=evidence_cache,
         )
-        mountpoint_uncertainties = mountpoint_lookup.uncertainty_reasons
-        path_is_mountpoint = (
-            None
-            if mountpoint_uncertainties
-            else (
-                mountpoint_lookup.resolved_path_used_for_lookup
-                in self.mount_table.visible_mount_by_mountpoint
+        mountpoint_uncertainties = list(mountpoint_lookup.uncertainty_reasons)
+        if parent_directory_path is not None:
+            parent_mountpoint_lookup = self._lookup_mount_within_path_assessment(
+                parent_directory_path,
+                follow_final_symbolic_link=True,
+                evidence_cache=evidence_cache,
             )
-        )
+            mountpoint_uncertainties.extend(
+                parent_mountpoint_lookup.uncertainty_reasons
+            )
+            path_is_mountpoint = (
+                None
+                if mountpoint_uncertainties
+                else (
+                    mountpoint_lookup.mount_record.mount_id
+                    != parent_mountpoint_lookup.mount_record.mount_id
+                )
+            )
+        else:
+            path_is_mountpoint = (
+                None
+                if mountpoint_uncertainties
+                else (
+                    mountpoint_lookup.resolved_path_used_for_lookup
+                    in self.mount_table.visible_mount_by_mountpoint
+                )
+            )
         if path_is_mountpoint is True:
             evidence_reasons.append(
                 EvidenceReason(
@@ -3616,9 +5115,10 @@ class LinuxFilesystemMutationPermissionAuditor:
             evidence_reasons.extend(mountpoint_uncertainties)
             model_has_uncertain_evidence = True
 
-        parent_directory_path = lexically_normalize_absolute_path(
-            os.path.dirname(path) or "/"
-        )
+        if parent_directory_path is None:
+            parent_directory_path = lexically_normalize_absolute_path(
+                os.path.dirname(path) or "/"
+            )
         (
             filesystem_uncertainty_reasons,
             filesystem_semantics_are_uncertain,
@@ -3633,7 +5133,18 @@ class LinuxFilesystemMutationPermissionAuditor:
             # Deletion resolves symbolic links in every parent component.
             # os.stat is therefore intentional; os.lstat would inspect the
             # wrong inode when the lexical parent is itself a symbolic link.
-            parent_directory_metadata = os.stat(parent_directory_path)
+            stable_parent_file_descriptor = (
+                None
+                if evidence_cache is None
+                else evidence_cache.file_descriptor_by_path_and_follow_mode.get(
+                    (parent_directory_path, True)
+                )
+            )
+            parent_directory_metadata = (
+                os.fstat(stable_parent_file_descriptor)
+                if stable_parent_file_descriptor is not None
+                else os.stat(parent_directory_path)
+            )
         except OSError as error:
             evidence_reasons.append(
                 operating_system_error_reason(
@@ -3712,13 +5223,19 @@ class LinuxFilesystemMutationPermissionAuditor:
             (search_access, "parent_directory_is_not_searchable"),
         ):
             if access_evidence.access_is_allowed is False:
-                evidence_reasons.append(
-                    EvidenceReason(
-                        blocked_reason_code,
-                        evidence_source="os.access",
+                access_reasons, access_uncertain, access_blocks = (
+                    self._infer_denied_access_constraint(
+                        access_evidence=access_evidence,
+                        target_metadata=parent_directory_metadata,
+                        blocked_reason_code=blocked_reason_code,
+                        potentially_changeable_reason_code=(
+                            "parent_directory_access_may_be_changeable_by_chmod"
+                        ),
                     )
                 )
-                model_has_blocking_evidence = True
+                evidence_reasons.extend(access_reasons)
+                model_has_uncertain_evidence |= access_uncertain
+                model_has_blocking_evidence |= access_blocks
             elif access_evidence.access_is_allowed is None:
                 if access_evidence.uncertainty_reason is not None:
                     evidence_reasons.append(access_evidence.uncertainty_reason)
@@ -3756,22 +5273,33 @@ class LinuxFilesystemMutationPermissionAuditor:
                 evidence_cache=evidence_cache,
             )
         )
-        if parent_attribute_evidence.immutable_attribute_is_set is True:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "parent_directory_immutable_attribute_blocks_deletion",
-                    evidence_source="statx.stx_attributes",
+        for (
+            attribute_is_set,
+            blocking_reason_code,
+            clearable_reason_code,
+        ) in (
+            (
+                parent_attribute_evidence.immutable_attribute_is_set,
+                "parent_directory_immutable_attribute_blocks_deletion",
+                "parent_directory_immutable_attribute_may_be_clearable_before_deletion",
+            ),
+            (
+                parent_attribute_evidence.append_only_attribute_is_set,
+                "parent_directory_append_only_attribute_blocks_deletion",
+                "parent_directory_append_only_attribute_may_be_clearable_before_deletion",
+            ),
+        ):
+            attribute_reasons, attribute_uncertain, attribute_blocks = (
+                self._infer_set_inode_flag_constraint(
+                    attribute_is_set=attribute_is_set,
+                    inode_owner_user_id=parent_directory_metadata.st_uid,
+                    blocking_reason_code=blocking_reason_code,
+                    potentially_clearable_reason_code=clearable_reason_code,
                 )
             )
-            model_has_blocking_evidence = True
-        if parent_attribute_evidence.append_only_attribute_is_set is True:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "parent_directory_append_only_attribute_blocks_deletion",
-                    evidence_source="statx.stx_attributes",
-                )
-            )
-            model_has_blocking_evidence = True
+            evidence_reasons.extend(attribute_reasons)
+            model_has_uncertain_evidence |= attribute_uncertain
+            model_has_blocking_evidence |= attribute_blocks
         if parent_attribute_evidence.evidence_is_uncertain:
             evidence_reasons.extend(parent_attribute_evidence.uncertainty_reasons)
             model_has_uncertain_evidence = True
@@ -3860,6 +5388,199 @@ class LinuxFilesystemMutationPermissionAuditor:
             False,
         )
 
+    def _infer_set_inode_flag_constraint(
+        self,
+        *,
+        attribute_is_set: bool | None,
+        inode_owner_user_id: int,
+        blocking_reason_code: str,
+        potentially_clearable_reason_code: str,
+    ) -> tuple[list[EvidenceReason], bool, bool]:
+        """Model FS_IOC_SETFLAGS authority without claiming namespace scope."""
+        if attribute_is_set is not True:
+            return [], False, False
+
+        filesystem_identifiers = self.process_credentials.filesystem_identifiers
+        if filesystem_identifiers.uncertainty_reason is not None:
+            return [filesystem_identifiers.uncertainty_reason], True, False
+        filesystem_user_id = filesystem_identifiers.filesystem_user_id
+        if filesystem_user_id is None:
+            return (
+                [
+                    EvidenceReason(
+                        "filesystem_user_id_is_unobserved_for_inode_flag_change",
+                        evidence_source=LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH,
+                    )
+                ],
+                True,
+                False,
+            )
+
+        effective_capabilities = self.process_credentials.effective_capabilities
+        immutable_capability_presence = effective_capabilities.capability_presence(
+            LINUX_CAPABILITY_LINUX_IMMUTABLE_NUMBER
+        )
+        if filesystem_user_id == inode_owner_user_id:
+            owner_or_fowner_authority: bool | None = True
+        else:
+            owner_or_fowner_authority = effective_capabilities.capability_presence(
+                LINUX_CAPABILITY_FOWNER_NUMBER
+            )
+
+        if immutable_capability_presence is False or owner_or_fowner_authority is False:
+            return (
+                [
+                    EvidenceReason(
+                        blocking_reason_code,
+                        evidence_source=(
+                            "statx attributes, inode st_uid, filesystem UID, and CapEff"
+                        ),
+                    )
+                ],
+                False,
+                True,
+            )
+        if immutable_capability_presence is None or owner_or_fowner_authority is None:
+            return (
+                [
+                    effective_capabilities.uncertainty_reason
+                    or EvidenceReason(
+                        "inode_flag_change_capability_presence_is_unknown",
+                        evidence_source=LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH,
+                    )
+                ],
+                True,
+                False,
+            )
+
+        return (
+            [
+                EvidenceReason(
+                    potentially_clearable_reason_code,
+                    evidence_source=(
+                        "FS_IOC_SETFLAGS ownership and effective-capability model"
+                    ),
+                    detail=(
+                        "the required capability's governing user-namespace scope "
+                        "and the intervening ioctl outcome are not proven"
+                    ),
+                )
+            ],
+            True,
+            False,
+        )
+
+    def _infer_denied_access_constraint(
+        self,
+        *,
+        access_evidence: KernelPathAccessEvidence,
+        target_metadata: os.stat_result | None,
+        blocked_reason_code: str,
+        potentially_changeable_reason_code: str,
+    ) -> tuple[list[EvidenceReason], bool, bool]:
+        """Avoid treating owner-changeable mode/ACL denial as permanent."""
+        if access_evidence.operating_system_errno == errno.EPERM:
+            return (
+                [
+                    EvidenceReason(
+                        "access_denial_may_reflect_a_separately_modeled_inode_constraint",
+                        evidence_source=access_evidence.evidence_source,
+                        operating_system_errno=errno.EPERM,
+                        operating_system_message=os.strerror(errno.EPERM),
+                    )
+                ],
+                True,
+                False,
+            )
+        if target_metadata is None:
+            return (
+                [
+                    EvidenceReason(
+                        blocked_reason_code,
+                        evidence_source=access_evidence.evidence_source,
+                    )
+                ],
+                False,
+                True,
+            )
+
+        filesystem_identifiers = self.process_credentials.filesystem_identifiers
+        if filesystem_identifiers.uncertainty_reason is not None:
+            return [filesystem_identifiers.uncertainty_reason], True, False
+        filesystem_user_id = filesystem_identifiers.filesystem_user_id
+        if filesystem_user_id is None:
+            return (
+                [
+                    EvidenceReason(
+                        "filesystem_user_id_is_unobserved_for_chmod_authority",
+                        evidence_source=LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH,
+                    )
+                ],
+                True,
+                False,
+            )
+
+        if filesystem_user_id == target_metadata.st_uid:
+            return (
+                [
+                    EvidenceReason(
+                        potentially_changeable_reason_code,
+                        evidence_source="inode st_uid and filesystem UID",
+                        detail=(
+                            "the inode owner may be able to grant the needed "
+                            "mode bits with a preceding chmod; that syscall was "
+                            "not executed"
+                        ),
+                    )
+                ],
+                True,
+                False,
+            )
+
+        effective_capabilities = self.process_credentials.effective_capabilities
+        fowner_capability_presence = effective_capabilities.capability_presence(
+            LINUX_CAPABILITY_FOWNER_NUMBER
+        )
+        if fowner_capability_presence is True:
+            return (
+                [
+                    EvidenceReason(
+                        potentially_changeable_reason_code,
+                        evidence_source=(
+                            f"{LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH} CapEff"
+                        ),
+                        detail=(
+                            "CAP_FOWNER is present, but its governing user-namespace "
+                            "scope and a preceding chmod outcome are not proven"
+                        ),
+                    )
+                ],
+                True,
+                False,
+            )
+        if fowner_capability_presence is None:
+            return (
+                [
+                    effective_capabilities.uncertainty_reason
+                    or EvidenceReason(
+                        "cap_fowner_presence_is_unknown_for_chmod_authority",
+                        evidence_source=LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH,
+                    )
+                ],
+                True,
+                False,
+            )
+        return (
+            [
+                EvidenceReason(
+                    blocked_reason_code,
+                    evidence_source=access_evidence.evidence_source,
+                )
+            ],
+            False,
+            True,
+        )
+
     def infer_regular_file_content_mutation(
         self,
         path: str,
@@ -3867,6 +5588,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         requested_content_capability: str,
         *,
         evidence_cache: PathAssessmentEvidenceCache | None = None,
+        target_metadata: os.stat_result | None = None,
     ) -> CapabilityModelInference:
         if requested_content_capability not in {
             CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
@@ -3901,13 +5623,30 @@ class LinuxFilesystemMutationPermissionAuditor:
             )
         )
         if inode_attribute_evidence.immutable_attribute_is_set is True:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "target_immutable_attribute_blocks_content_mutation",
-                    evidence_source="statx.stx_attributes",
+            if target_metadata is None:
+                evidence_reasons.append(
+                    EvidenceReason(
+                        "target_immutable_attribute_blocks_content_mutation",
+                        evidence_source="statx.stx_attributes",
+                    )
                 )
-            )
-            model_has_blocking_evidence = True
+                model_has_blocking_evidence = True
+            else:
+                attribute_reasons, attribute_uncertain, attribute_blocks = (
+                    self._infer_set_inode_flag_constraint(
+                        attribute_is_set=True,
+                        inode_owner_user_id=target_metadata.st_uid,
+                        blocking_reason_code=(
+                            "target_immutable_attribute_blocks_content_mutation"
+                        ),
+                        potentially_clearable_reason_code=(
+                            "target_immutable_attribute_may_be_clearable_before_content_mutation"
+                        ),
+                    )
+                )
+                evidence_reasons.extend(attribute_reasons)
+                model_has_uncertain_evidence |= attribute_uncertain
+                model_has_blocking_evidence |= attribute_blocks
         if inode_attribute_evidence.append_only_attribute_is_set is True:
             if requested_content_capability == CAPABILITY_APPEND_REGULAR_FILE_CONTENT:
                 evidence_reasons.append(
@@ -3917,13 +5656,30 @@ class LinuxFilesystemMutationPermissionAuditor:
                     )
                 )
             else:
-                evidence_reasons.append(
-                    EvidenceReason(
-                        "target_append_only_attribute_blocks_overwrite",
-                        evidence_source="statx.stx_attributes",
+                if target_metadata is None:
+                    evidence_reasons.append(
+                        EvidenceReason(
+                            "target_append_only_attribute_blocks_overwrite",
+                            evidence_source="statx.stx_attributes",
+                        )
                     )
-                )
-                model_has_blocking_evidence = True
+                    model_has_blocking_evidence = True
+                else:
+                    attribute_reasons, attribute_uncertain, attribute_blocks = (
+                        self._infer_set_inode_flag_constraint(
+                            attribute_is_set=True,
+                            inode_owner_user_id=target_metadata.st_uid,
+                            blocking_reason_code=(
+                                "target_append_only_attribute_blocks_overwrite"
+                            ),
+                            potentially_clearable_reason_code=(
+                                "target_append_only_attribute_may_be_clearable_before_overwrite"
+                            ),
+                        )
+                    )
+                    evidence_reasons.extend(attribute_reasons)
+                    model_has_uncertain_evidence |= attribute_uncertain
+                    model_has_blocking_evidence |= attribute_blocks
         if inode_attribute_evidence.verity_attribute_is_set is True:
             evidence_reasons.append(
                 EvidenceReason(
@@ -3978,13 +5734,21 @@ class LinuxFilesystemMutationPermissionAuditor:
             evidence_cache=evidence_cache,
         )
         if write_access_evidence.access_is_allowed is False:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "target_is_not_writable_by_requested_credential_model",
-                    evidence_source="os.access",
+            access_reasons, access_uncertain, access_blocks = (
+                self._infer_denied_access_constraint(
+                    access_evidence=write_access_evidence,
+                    target_metadata=target_metadata,
+                    blocked_reason_code=(
+                        "target_is_not_writable_by_requested_credential_model"
+                    ),
+                    potentially_changeable_reason_code=(
+                        "target_write_access_may_be_changeable_by_chmod"
+                    ),
                 )
             )
-            model_has_blocking_evidence = True
+            evidence_reasons.extend(access_reasons)
+            model_has_uncertain_evidence |= access_uncertain
+            model_has_blocking_evidence |= access_blocks
         elif write_access_evidence.access_is_allowed is None:
             if write_access_evidence.uncertainty_reason is not None:
                 evidence_reasons.append(write_access_evidence.uncertainty_reason)
@@ -4028,13 +5792,21 @@ class LinuxFilesystemMutationPermissionAuditor:
             )
         )
         if inode_attribute_evidence.immutable_attribute_is_set is True:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "directory_immutable_attribute_blocks_creation",
-                    evidence_source="statx.stx_attributes",
+            attribute_reasons, attribute_uncertain, attribute_blocks = (
+                self._infer_set_inode_flag_constraint(
+                    attribute_is_set=True,
+                    inode_owner_user_id=directory_metadata.st_uid,
+                    blocking_reason_code=(
+                        "directory_immutable_attribute_blocks_creation"
+                    ),
+                    potentially_clearable_reason_code=(
+                        "directory_immutable_attribute_may_be_clearable_before_creation"
+                    ),
                 )
             )
-            model_has_blocking_evidence = True
+            evidence_reasons.extend(attribute_reasons)
+            model_has_uncertain_evidence |= attribute_uncertain
+            model_has_blocking_evidence |= attribute_blocks
         if inode_attribute_evidence.append_only_attribute_is_set is True:
             evidence_reasons.append(
                 EvidenceReason(
@@ -4080,13 +5852,19 @@ class LinuxFilesystemMutationPermissionAuditor:
             (search_access, "directory_is_not_searchable"),
         ):
             if access_evidence.access_is_allowed is False:
-                evidence_reasons.append(
-                    EvidenceReason(
-                        blocked_reason_code,
-                        evidence_source="os.access",
+                access_reasons, access_uncertain, access_blocks = (
+                    self._infer_denied_access_constraint(
+                        access_evidence=access_evidence,
+                        target_metadata=directory_metadata,
+                        blocked_reason_code=blocked_reason_code,
+                        potentially_changeable_reason_code=(
+                            "directory_access_may_be_changeable_by_chmod"
+                        ),
                     )
                 )
-                model_has_blocking_evidence = True
+                evidence_reasons.extend(access_reasons)
+                model_has_uncertain_evidence |= access_uncertain
+                model_has_blocking_evidence |= access_blocks
             elif access_evidence.access_is_allowed is None:
                 if access_evidence.uncertainty_reason is not None:
                     evidence_reasons.append(access_evidence.uncertainty_reason)
@@ -4102,6 +5880,10 @@ class LinuxFilesystemMutationPermissionAuditor:
     def infer_create_explicit_missing_path(
         self,
         missing_path: str,
+        *,
+        parent_directory_path: str | None = None,
+        parent_directory_metadata: os.stat_result | None = None,
+        evidence_cache: PathAssessmentEvidenceCache | None = None,
     ) -> CapabilityModelInference:
         normalized_missing_path = lexically_normalize_absolute_path(missing_path)
         if normalized_missing_path == "/":
@@ -4129,49 +5911,52 @@ class LinuxFilesystemMutationPermissionAuditor:
                 ),
             )
 
-        parent_directory_path = lexically_normalize_absolute_path(
-            os.path.dirname(normalized_missing_path) or "/"
-        )
-        try:
-            parent_directory_metadata = os.stat(parent_directory_path)
-        except FileNotFoundError:
-            return capability_inference(
-                CAPABILITY_CREATE_DIRECTORY_ENTRY,
-                MODEL_VERDICT_INDICATES_BLOCKED,
-                (
-                    EvidenceReason(
-                        "creation_parent_directory_is_missing",
-                        evidence_source="os.stat",
-                    ),
-                ),
+        if parent_directory_path is None:
+            parent_directory_path = lexically_normalize_absolute_path(
+                os.path.dirname(normalized_missing_path) or "/"
             )
-        except NotADirectoryError:
-            return capability_inference(
-                CAPABILITY_CREATE_DIRECTORY_ENTRY,
-                MODEL_VERDICT_INDICATES_BLOCKED,
-                (
-                    EvidenceReason(
-                        "creation_parent_component_is_not_a_directory",
-                        evidence_source="os.stat",
+        if parent_directory_metadata is None:
+            try:
+                parent_directory_metadata = os.stat(parent_directory_path)
+            except FileNotFoundError:
+                return capability_inference(
+                    CAPABILITY_CREATE_DIRECTORY_ENTRY,
+                    MODEL_VERDICT_INDICATES_BLOCKED,
+                    (
+                        EvidenceReason(
+                            "creation_parent_directory_is_missing",
+                            evidence_source="os.stat",
+                        ),
                     ),
-                ),
-            )
-        except OSError as error:
-            return capability_inference(
-                CAPABILITY_CREATE_DIRECTORY_ENTRY,
-                MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
-                (
-                    operating_system_error_reason(
-                        "cannot_observe_creation_parent_directory",
-                        error,
-                        evidence_source="os.stat",
+                )
+            except NotADirectoryError:
+                return capability_inference(
+                    CAPABILITY_CREATE_DIRECTORY_ENTRY,
+                    MODEL_VERDICT_INDICATES_BLOCKED,
+                    (
+                        EvidenceReason(
+                            "creation_parent_component_is_not_a_directory",
+                            evidence_source="os.stat",
+                        ),
                     ),
-                ),
-            )
+                )
+            except OSError as error:
+                return capability_inference(
+                    CAPABILITY_CREATE_DIRECTORY_ENTRY,
+                    MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                    (
+                        operating_system_error_reason(
+                            "cannot_observe_creation_parent_directory",
+                            error,
+                            evidence_source="os.stat",
+                        ),
+                    ),
+                )
 
         parent_inference = self.infer_create_child_in_directory(
             parent_directory_path,
             parent_directory_metadata,
+            evidence_cache=evidence_cache,
         )
         if parent_inference.model_verdict == MODEL_VERDICT_INDICATES_ALLOWED:
             return add_observation_reasons_to_inference(
@@ -4191,6 +5976,7 @@ class LinuxFilesystemMutationPermissionAuditor:
         filesystem_object_kind: str,
         *,
         evidence_cache: PathAssessmentEvidenceCache | None = None,
+        target_metadata: os.stat_result | None = None,
     ) -> CapabilityModelInference:
         if filesystem_object_kind in {
             FILESYSTEM_OBJECT_KIND_UNOBSERVED,
@@ -4241,13 +6027,30 @@ class LinuxFilesystemMutationPermissionAuditor:
             )
         )
         if inode_attribute_evidence.immutable_attribute_is_set is True:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "target_immutable_attribute_blocks_special_file_write",
-                    evidence_source="statx.stx_attributes",
+            if target_metadata is None:
+                evidence_reasons.append(
+                    EvidenceReason(
+                        "target_immutable_attribute_blocks_special_file_write",
+                        evidence_source="statx.stx_attributes",
+                    )
                 )
-            )
-            model_has_blocking_evidence = True
+                model_has_blocking_evidence = True
+            else:
+                attribute_reasons, attribute_uncertain, attribute_blocks = (
+                    self._infer_set_inode_flag_constraint(
+                        attribute_is_set=True,
+                        inode_owner_user_id=target_metadata.st_uid,
+                        blocking_reason_code=(
+                            "target_immutable_attribute_blocks_special_file_write"
+                        ),
+                        potentially_clearable_reason_code=(
+                            "target_immutable_attribute_may_be_clearable_before_special_file_write"
+                        ),
+                    )
+                )
+                evidence_reasons.extend(attribute_reasons)
+                model_has_uncertain_evidence |= attribute_uncertain
+                model_has_blocking_evidence |= attribute_blocks
         if inode_attribute_evidence.append_only_attribute_is_set is True:
             evidence_reasons.append(
                 EvidenceReason(
@@ -4272,7 +6075,7 @@ class LinuxFilesystemMutationPermissionAuditor:
 
         # A read-only mount controls filesystem mutation.  Whether it blocks
         # I/O through a FIFO/socket/device node varies by object and kernel
-        # path, so os.access plus an explicit runtime-semantics boundary is more
+        # path, so faccessat2 plus an explicit runtime-semantics boundary is more
         # accurate than treating mount "ro" as a universal hard failure here.
         mount_lookup = self._lookup_mount_within_path_assessment(
             path,
@@ -4289,13 +6092,21 @@ class LinuxFilesystemMutationPermissionAuditor:
             evidence_cache=evidence_cache,
         )
         if write_access_evidence.access_is_allowed is False:
-            evidence_reasons.append(
-                EvidenceReason(
-                    "special_file_is_not_writable_by_requested_credential_model",
-                    evidence_source="os.access",
+            access_reasons, access_uncertain, access_blocks = (
+                self._infer_denied_access_constraint(
+                    access_evidence=write_access_evidence,
+                    target_metadata=target_metadata,
+                    blocked_reason_code=(
+                        "special_file_is_not_writable_by_requested_credential_model"
+                    ),
+                    potentially_changeable_reason_code=(
+                        "special_file_write_access_may_be_changeable_by_chmod"
+                    ),
                 )
             )
-            model_has_blocking_evidence = True
+            evidence_reasons.extend(access_reasons)
+            model_has_uncertain_evidence |= access_uncertain
+            model_has_blocking_evidence |= access_blocks
         elif write_access_evidence.access_is_allowed is None:
             if write_access_evidence.uncertainty_reason is not None:
                 evidence_reasons.append(write_access_evidence.uncertainty_reason)
@@ -4365,6 +6176,40 @@ class LinuxFilesystemMutationPermissionAuditor:
                 False,
             )
         if mount_lookup.mount_record.filesystem_is_mounted_read_only:
+            sys_admin_presence = (
+                self.process_credentials.effective_capabilities.capability_presence(
+                    LINUX_CAPABILITY_SYS_ADMIN_NUMBER
+                )
+            )
+            if sys_admin_presence is True:
+                return (
+                    [
+                        EvidenceReason(
+                            "read_only_mount_may_be_remountable_with_cap_sys_admin",
+                            evidence_source=(
+                                f"{LINUX_MOUNTINFO_SOURCE_PATH} and "
+                                f"{LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH}"
+                            ),
+                            detail=linux_mount_record_evidence_summary(
+                                mount_lookup.mount_record
+                            ),
+                        )
+                    ],
+                    True,
+                    False,
+                )
+            if sys_admin_presence is None:
+                return (
+                    [
+                        self.process_credentials.effective_capabilities.uncertainty_reason
+                        or EvidenceReason(
+                            "cap_sys_admin_presence_is_unknown_for_read_only_mount",
+                            evidence_source=LINUX_CURRENT_THREAD_STATUS_SOURCE_PATH,
+                        )
+                    ],
+                    True,
+                    False,
+                )
             return (
                 [
                     EvidenceReason(
@@ -4392,6 +6237,8 @@ class AuditCommandLineConfiguration:
     requested_output_presentation: str
     replace_existing_output: bool
     include_nonmatching_records: bool
+    full_audit: bool
+    fail_on_uncertainty: bool
     include_home_paths_in_default_scan: bool
     include_temporary_directory_in_default_scan: bool
     include_proc_filesystem_in_default_scan: bool
@@ -4472,17 +6319,19 @@ def parse_audit_command_line_arguments(
     try:
         scan_root_paths = tuple(
             deduplicate_preserving_first_occurrence(
-                lexically_normalize_absolute_path(scan_root_path)
+                absolute_path_without_lexical_normalization(scan_root_path)
                 for scan_root_path in unnormalized_scan_root_paths
             )
         )
         output_destination = (
             "-"
             if parsed_arguments.output_destination == "-"
-            else lexically_normalize_absolute_path(parsed_arguments.output_destination)
+            else absolute_path_without_lexical_normalization(
+                parsed_arguments.output_destination
+            )
         )
     except (OSError, ValueError) as error:
-        argument_parser.error(f"cannot normalize configured path: {error}")
+        argument_parser.error(f"cannot prepare configured path: {error}")
     requested_capabilities = (
         tuple(parsed_arguments.selected_capabilities)
         if parsed_arguments.selected_capabilities
@@ -4502,7 +6351,11 @@ def parse_audit_command_line_arguments(
         output_destination=output_destination,
         requested_output_presentation=(parsed_arguments.requested_output_presentation),
         replace_existing_output=(parsed_arguments.replace_existing_output),
-        include_nonmatching_records=(parsed_arguments.include_nonmatching_records),
+        include_nonmatching_records=(
+            parsed_arguments.include_nonmatching_records or parsed_arguments.full_audit
+        ),
+        full_audit=parsed_arguments.full_audit,
+        fail_on_uncertainty=parsed_arguments.fail_on_uncertainty,
         include_home_paths_in_default_scan=(
             parsed_arguments.include_home_paths_in_default_scan
         ),
@@ -4600,10 +6453,32 @@ def add_audit_scope_arguments(
     argument_parser: argparse.ArgumentParser,
 ) -> None:
     argument_parser.add_argument(
+        "--full-audit",
+        dest="full_audit",
+        action="store_true",
+        help=(
+            "Include every assessed path plus routine and material uncertainty "
+            "evidence. Implies JSON unless --human is explicit; normal output "
+            "stays focused on permission findings."
+        ),
+    )
+    argument_parser.add_argument(
         "--include-nonmatching-records",
         dest="include_nonmatching_records",
         action="store_true",
-        help="Include blocked, uncertain, and skipped records.",
+        help=(
+            "Include blocked, skipped, and both grades of uncertain records; "
+            "the compatibility spelling of the full evidence view."
+        ),
+    )
+    argument_parser.add_argument(
+        "--fail-on-uncertainty",
+        dest="fail_on_uncertainty",
+        action="store_true",
+        help=(
+            "Write the complete report, then exit 5 if any selected capability "
+            "or run-level evidence has material uncertainty."
+        ),
     )
     argument_parser.add_argument(
         "--include-default-home-paths",
@@ -4650,7 +6525,7 @@ def add_process_identity_arguments(
         default=[],
         metavar="PATH",
         help=(
-            "Exclude exactly one lexical file path or observed directory "
+            "Exclude exactly one kernel-resolved file path or observed directory "
             "subtree; repeat for multiple exclusions."
         ),
     )
@@ -4679,9 +6554,9 @@ def audit_argument_parser_epilog() -> str:
 Evidence boundary:
   The model observes access decisions, metadata, mount state, sticky rules, and
   immutable, append-only, and verity attributes. It does not execute a mutation.
-  Every JSONL path record separates allowed, blocked, uncertain, and skipped
-  capability evidence and carries the complete run/source provenance needed
-  when records move independently.
+  Normal output reports permission findings and material evidence failures;
+  --full-audit adds blocked/skipped records and expected routine limitations.
+  JSONL path records carry the run/source provenance needed when moved alone.
 
 Capability names:
 {capability_definition_lines}
@@ -4694,6 +6569,7 @@ Output presentation:
 
   --tty and --human are aliases that force compact path lines.
   --json and --machine are aliases that force JSON Lines records.
+  --full-audit selects JSON Lines unless a human override is explicit.
 
   Human path lines use [labels] before each path, append / to directories, and
   show resolved symbolic links as link -> target. An unlabeled line requested
@@ -4712,6 +6588,7 @@ Examples:
   %(prog)s --stay-on-starting-filesystem /explicit/path
   %(prog)s --human /explicit/path | less
   %(prog)s --machine /explicit/path
+  %(prog)s --full-audit /var/tmp/project > full-audit.jsonl
   %(prog)s --capability {CAPABILITY_DELETE_ENTRY_OR_TREE} --include-nonmatching-records /var/tmp/project
   %(prog)s --exclude /tmp --exclude /proc /opt
   %(prog)s --output report.jsonl /srv/project
@@ -4824,10 +6701,14 @@ class AuditRunProvenance:
     path_record_emission_policy: str
     filesystem_types_with_unmodeled_mutation_semantics: tuple[str, ...]
     report_transport: str
-    normalized_report_destination_path: str | None
+    requested_report_destination_path: str | None
     existing_report_replacement_was_authorized: bool
 
-    def as_serializable_dictionary(self) -> dict[str, object]:
+    def as_serializable_dictionary(
+        self,
+        *,
+        include_routine_uncertainty: bool,
+    ) -> dict[str, object]:
         source_file_evidence = self.observed_tool_source_file
         source_file_dictionary: dict[str, object] = {
             "source_file_path": source_file_evidence.source_file_path,
@@ -4850,7 +6731,13 @@ class AuditRunProvenance:
                     source_file_evidence.source_file_identity.inode_number
                 ),
             }
-        if source_file_evidence.uncertainty_reason is not None:
+        if source_file_evidence.uncertainty_reason is not None and (
+            include_routine_uncertainty
+            or evidence_reason_uncertainty_grade(
+                source_file_evidence.uncertainty_reason
+            )
+            != UNCERTAINTY_GRADE_ROUTINE
+        ):
             source_file_dictionary["uncertainty_reason"] = (
                 source_file_evidence.uncertainty_reason.as_serializable_dictionary()
             )
@@ -4887,25 +6774,44 @@ class AuditRunProvenance:
                 effective_capability_evidence.observed_at_utc
             ),
         }
-        if filesystem_identifier_evidence.uncertainty_reason is not None:
+        if filesystem_identifier_evidence.uncertainty_reason is not None and (
+            include_routine_uncertainty
+            or evidence_reason_uncertainty_grade(
+                filesystem_identifier_evidence.uncertainty_reason
+            )
+            != UNCERTAINTY_GRADE_ROUTINE
+        ):
             credential_dictionary["filesystem_identifier_uncertainty_reason"] = (
                 filesystem_identifier_evidence.uncertainty_reason.as_serializable_dictionary()
             )
-        if effective_capability_evidence.uncertainty_reason is not None:
+        if effective_capability_evidence.uncertainty_reason is not None and (
+            include_routine_uncertainty
+            or evidence_reason_uncertainty_grade(
+                effective_capability_evidence.uncertainty_reason
+            )
+            != UNCERTAINTY_GRADE_ROUTINE
+        ):
             credential_dictionary["effective_capability_uncertainty_reason"] = (
                 effective_capability_evidence.uncertainty_reason.as_serializable_dictionary()
             )
 
+        visible_mount_uncertainty_reasons = [
+            reason
+            for reason in self.mount_table_read.uncertainty_reasons
+            if include_routine_uncertainty
+            or evidence_reason_uncertainty_grade(reason) != UNCERTAINTY_GRADE_ROUTINE
+        ]
         mount_table_dictionary: dict[str, object] = {
             "source_path": self.mount_table_read.source_path,
             "source_sha256": self.mount_table_read.source_sha256,
             "observed_at_utc": self.mount_table_read.observed_at_utc,
             "parsed_mount_record_count": len(self.mount_table_read.mount_records),
-            "uncertainty_reasons": [
-                reason.as_serializable_dictionary()
-                for reason in self.mount_table_read.uncertainty_reasons
-            ],
         }
+        if include_routine_uncertainty or visible_mount_uncertainty_reasons:
+            mount_table_dictionary["uncertainty_reasons"] = [
+                reason.as_serializable_dictionary()
+                for reason in visible_mount_uncertainty_reasons
+            ]
         serialized_exclusion_rules: list[dict[str, object]] = []
         for exclusion_rule in self.audit_scope.exclusion_rules:
             serialized_rule: dict[str, object] = {
@@ -4913,7 +6819,13 @@ class AuditRunProvenance:
                 "includes_descendants": (exclusion_rule.includes_descendants),
                 "rule_origin": exclusion_rule.rule_origin,
             }
-            if exclusion_rule.classification_uncertainty_reason is not None:
+            if exclusion_rule.classification_uncertainty_reason is not None and (
+                include_routine_uncertainty
+                or evidence_reason_uncertainty_grade(
+                    exclusion_rule.classification_uncertainty_reason
+                )
+                != UNCERTAINTY_GRADE_ROUTINE
+            ):
                 serialized_rule["classification_uncertainty_reason"] = (
                     exclusion_rule.classification_uncertainty_reason.as_serializable_dictionary()
                 )
@@ -4933,7 +6845,7 @@ class AuditRunProvenance:
                 "reason": "not_required_by_configured_scan_scope",
             }
         else:
-            serialized_audit_scope["home_directory_discovery"] = {
+            serialized_home_discovery: dict[str, object] = {
                 "performed": True,
                 "observed_at_utc": home_discovery.observed_at_utc,
                 "accepted_home_directory_exclusion_paths": list(
@@ -4943,11 +6855,22 @@ class AuditRunProvenance:
                     observation.as_serializable_dictionary()
                     for observation in home_discovery.candidate_observations
                 ],
-                "uncertainty_reasons": [
-                    reason.as_serializable_dictionary()
-                    for reason in home_discovery.uncertainty_reasons
-                ],
             }
+            visible_home_uncertainty_reasons = [
+                reason
+                for reason in home_discovery.uncertainty_reasons
+                if include_routine_uncertainty
+                or evidence_reason_uncertainty_grade(reason)
+                != UNCERTAINTY_GRADE_ROUTINE
+            ]
+            if include_routine_uncertainty or visible_home_uncertainty_reasons:
+                serialized_home_discovery["uncertainty_reasons"] = [
+                    reason.as_serializable_dictionary()
+                    for reason in visible_home_uncertainty_reasons
+                ]
+            serialized_audit_scope["home_directory_discovery"] = (
+                serialized_home_discovery
+            )
         temporary_discovery = self.audit_scope.temporary_directory_discovery
         if temporary_discovery is None:
             serialized_audit_scope["temporary_directory_discovery"] = {
@@ -4955,7 +6878,7 @@ class AuditRunProvenance:
                 "reason": "not_required_by_configured_scan_scope",
             }
         else:
-            serialized_audit_scope["temporary_directory_discovery"] = {
+            serialized_temporary_discovery: dict[str, object] = {
                 "performed": True,
                 "observed_at_utc": temporary_discovery.observed_at_utc,
                 "selected_writable_temporary_directory": (
@@ -4968,11 +6891,22 @@ class AuditRunProvenance:
                     reason.as_serializable_dictionary()
                     for reason in temporary_discovery.candidate_observations
                 ],
-                "uncertainty_reasons": [
-                    reason.as_serializable_dictionary()
-                    for reason in temporary_discovery.uncertainty_reasons
-                ],
             }
+            visible_temporary_uncertainty_reasons = [
+                reason
+                for reason in temporary_discovery.uncertainty_reasons
+                if include_routine_uncertainty
+                or evidence_reason_uncertainty_grade(reason)
+                != UNCERTAINTY_GRADE_ROUTINE
+            ]
+            if include_routine_uncertainty or visible_temporary_uncertainty_reasons:
+                serialized_temporary_discovery["uncertainty_reasons"] = [
+                    reason.as_serializable_dictionary()
+                    for reason in visible_temporary_uncertainty_reasons
+                ]
+            serialized_audit_scope["temporary_directory_discovery"] = (
+                serialized_temporary_discovery
+            )
 
         return {
             "audit_run_provenance_schema_id": (AUDIT_RUN_PROVENANCE_SCHEMA_ID),
@@ -4983,15 +6917,42 @@ class AuditRunProvenance:
             "capability_model_id": self.capability_model_id,
             "process_id": self.process_id,
             "linux_kernel_release": self.linux_kernel_release,
+            "linux_system_interface_support": {
+                "machine_architecture": RUNNING_MACHINE_ARCHITECTURE,
+                "libc_statx_wrapper_is_available": (_LINUX_STATX_FUNCTION is not None),
+                "raw_statx_syscall_number": linux_syscall_number("statx"),
+                "libc_renameat2_wrapper_is_available": (
+                    _LINUX_RENAMEAT2_FUNCTION is not None
+                ),
+                "raw_renameat2_syscall_number": linux_syscall_number("renameat2"),
+                "raw_faccessat2_syscall_number": linux_syscall_number("faccessat2"),
+                "libc_faccessat_wrapper_is_available": (
+                    _LINUX_FACCESSAT_FUNCTION is not None
+                ),
+                "faccessat_fallback_policy": (
+                    "matching real/effective/filesystem IDs; non-root; "
+                    "observed empty effective capability mask"
+                ),
+            },
             "observed_tool_source_file": source_file_dictionary,
             "process_credentials": credential_dictionary,
             "linux_mount_table": mount_table_dictionary,
             "audit_scope": serialized_audit_scope,
-            "capability_model_boundaries": [
-                boundary_reason.as_serializable_dictionary()
-                for boundary_reason in CAPABILITY_MODEL_BOUNDARY_REASONS
-            ],
-            "normalized_scan_root_paths": list(self.scan_root_paths),
+            **(
+                {
+                    "capability_model_boundaries": [
+                        boundary_reason.as_serializable_dictionary()
+                        for boundary_reason in CAPABILITY_MODEL_BOUNDARY_REASONS
+                    ]
+                }
+                if include_routine_uncertainty
+                else {}
+            ),
+            "requested_scan_root_paths": list(self.scan_root_paths),
+            "scan_root_path_resolution_policy": (
+                "kernel_component_resolution_before_descriptor_capture; "
+                "dot components and trailing separators are preserved"
+            ),
             "scan_roots_were_defaulted": self.scan_roots_were_defaulted,
             "selected_capabilities": list(self.selected_capabilities),
             "selected_capability_operation_definitions": {
@@ -5002,17 +6963,23 @@ class AuditRunProvenance:
             },
             "remain_on_starting_filesystem": (self.remain_on_starting_filesystem),
             "path_record_emission_policy": (self.path_record_emission_policy),
-            "filesystem_types_with_unmodeled_mutation_semantics": list(
-                self.filesystem_types_with_unmodeled_mutation_semantics
-            ),
-            "filesystem_type_prefixes_with_unmodeled_mutation_semantics": list(
-                FILESYSTEM_TYPE_PREFIXES_WITH_UNMODELED_MUTATION_SEMANTICS
+            **(
+                {
+                    "filesystem_types_with_unmodeled_mutation_semantics": list(
+                        self.filesystem_types_with_unmodeled_mutation_semantics
+                    ),
+                    "filesystem_type_prefixes_with_unmodeled_mutation_semantics": list(
+                        FILESYSTEM_TYPE_PREFIXES_WITH_UNMODELED_MUTATION_SEMANTICS
+                    ),
+                }
+                if include_routine_uncertainty
+                else {}
             ),
             "report_output_configuration": {
                 "report_transport": self.report_transport,
                 "report_format": "json_lines",
-                "normalized_report_destination_path": (
-                    self.normalized_report_destination_path
+                "requested_report_destination_path": (
+                    self.requested_report_destination_path
                 ),
                 "existing_report_replacement_was_authorized": (
                     self.existing_report_replacement_was_authorized
@@ -5029,6 +6996,7 @@ def build_audit_run_provenance(
     process_credentials: LinuxProcessCredentialEvidence,
     mount_table_read: LinuxMountTableReadEvidence,
     audit_scope: AuditScopeEvidence,
+    observed_tool_source_file: ObservedToolSourceFileEvidence,
 ) -> AuditRunProvenance:
     return AuditRunProvenance(
         audit_run_id=audit_run_id,
@@ -5038,7 +7006,7 @@ def build_audit_run_provenance(
         capability_model_id=CAPABILITY_MODEL_ID,
         process_id=os.getpid(),
         linux_kernel_release=RUNNING_LINUX_KERNEL_RELEASE,
-        observed_tool_source_file=observe_tool_source_file(),
+        observed_tool_source_file=observed_tool_source_file,
         process_credentials=process_credentials,
         mount_table_read=mount_table_read,
         audit_scope=audit_scope,
@@ -5059,7 +7027,7 @@ def build_audit_run_provenance(
             if configuration.output_destination == "-"
             else "private_jsonl_file"
         ),
-        normalized_report_destination_path=(
+        requested_report_destination_path=(
             None
             if configuration.output_destination == "-"
             else configuration.output_destination
@@ -5190,6 +7158,234 @@ def build_permission_auditor(
     )
 
 
+ENUMERATION_UNCERTAINTY_REASON_CODES = frozenset(
+    {
+        "cannot_open_requested_path_parent_directory",
+        "cannot_capture_requested_path",
+        "cannot_list_directory",
+        "cannot_continue_directory_listing",
+        "directory_traversal_file_descriptor_budget_exhausted",
+        "directory_identity_changed_between_capture_and_listing",
+        "directory_entry_changed_after_descriptor_capture",
+        "directory_entry_identity_changed_after_descriptor_capture",
+        "cannot_revalidate_requested_missing_path",
+        "requested_missing_path_appeared_during_assessment",
+        "path_disappeared_during_directory_scan",
+        "cannot_capture_directory_entry",
+    }
+)
+
+
+@dataclass
+class AuditRunStatistics:
+    assessed_path_count: int = 0
+    emitted_path_record_count: int = 0
+    filtered_path_count: int = 0
+    allowed_path_count: int = 0
+    blocked_path_count: int = 0
+    uncertain_path_count: int = 0
+    skipped_path_count: int = 0
+    filtered_uncertain_path_count: int = 0
+    selected_capability_uncertainty_path_count: int = 0
+    enumeration_uncertainty_path_count: int = 0
+    run_level_uncertainty_reason_count: int = 0
+    material_uncertain_path_count: int = 0
+    material_filtered_uncertain_path_count: int = 0
+    material_selected_capability_uncertainty_path_count: int = 0
+    material_enumeration_uncertainty_path_count: int = 0
+    material_run_level_uncertainty_reason_count: int = 0
+    routine_uncertain_path_count: int = 0
+    routine_filtered_uncertain_path_count: int = 0
+    routine_selected_capability_uncertainty_path_count: int = 0
+    routine_enumeration_uncertainty_path_count: int = 0
+    routine_run_level_uncertainty_reason_count: int = 0
+
+    @property
+    def uncertainty_was_observed(self) -> bool:
+        return bool(
+            self.uncertain_path_count
+            or self.selected_capability_uncertainty_path_count
+            or self.run_level_uncertainty_reason_count
+            or self.enumeration_uncertainty_path_count
+        )
+
+    @property
+    def material_uncertainty_was_observed(self) -> bool:
+        return bool(
+            self.material_uncertain_path_count
+            or self.material_selected_capability_uncertainty_path_count
+            or self.material_run_level_uncertainty_reason_count
+            or self.material_enumeration_uncertainty_path_count
+        )
+
+    @property
+    def filesystem_scope_enumeration_is_complete(self) -> bool:
+        return self.enumeration_uncertainty_path_count == 0
+
+    @property
+    def material_filesystem_scope_enumeration_is_complete(self) -> bool:
+        return self.material_enumeration_uncertainty_path_count == 0
+
+    def _uncertainty_counts_for_grade(self, grade: str) -> dict[str, int]:
+        if grade == UNCERTAINTY_GRADE_MATERIAL:
+            return {
+                "uncertain_path_count": self.material_uncertain_path_count,
+                "filtered_uncertain_path_count": (
+                    self.material_filtered_uncertain_path_count
+                ),
+                "selected_capability_uncertainty_path_count": (
+                    self.material_selected_capability_uncertainty_path_count
+                ),
+                "enumeration_uncertainty_path_count": (
+                    self.material_enumeration_uncertainty_path_count
+                ),
+                "run_level_uncertainty_reason_count": (
+                    self.material_run_level_uncertainty_reason_count
+                ),
+            }
+        if grade == UNCERTAINTY_GRADE_ROUTINE:
+            return {
+                "uncertain_path_count": self.routine_uncertain_path_count,
+                "filtered_uncertain_path_count": (
+                    self.routine_filtered_uncertain_path_count
+                ),
+                "selected_capability_uncertainty_path_count": (
+                    self.routine_selected_capability_uncertainty_path_count
+                ),
+                "enumeration_uncertainty_path_count": (
+                    self.routine_enumeration_uncertainty_path_count
+                ),
+                "run_level_uncertainty_reason_count": (
+                    self.routine_run_level_uncertainty_reason_count
+                ),
+            }
+        raise ValueError(f"unknown uncertainty grade: {grade!r}")
+
+    def as_serializable_dictionary(
+        self,
+        *,
+        include_routine_uncertainty: bool,
+    ) -> dict[str, object]:
+        serialized_statistics: dict[str, object] = {
+            "assessed_path_count": self.assessed_path_count,
+            "emitted_path_record_count": self.emitted_path_record_count,
+            "filtered_path_count": self.filtered_path_count,
+            "allowed_path_count": self.allowed_path_count,
+            "blocked_path_count": self.blocked_path_count,
+            "skipped_path_count": self.skipped_path_count,
+        }
+        if self.material_uncertainty_was_observed:
+            serialized_statistics["material_uncertainty"] = (
+                self._uncertainty_counts_for_grade(UNCERTAINTY_GRADE_MATERIAL)
+            )
+        if include_routine_uncertainty:
+            serialized_statistics["uncertainty_by_grade"] = {
+                UNCERTAINTY_GRADE_MATERIAL: self._uncertainty_counts_for_grade(
+                    UNCERTAINTY_GRADE_MATERIAL
+                ),
+                UNCERTAINTY_GRADE_ROUTINE: self._uncertainty_counts_for_grade(
+                    UNCERTAINTY_GRADE_ROUTINE
+                ),
+            }
+        return serialized_statistics
+
+
+@dataclass(frozen=True)
+class AuditExecutionResult:
+    statistics: AuditRunStatistics
+
+    @property
+    def uncertainty_was_observed(self) -> bool:
+        return self.statistics.uncertainty_was_observed
+
+
+def determine_assessment_model_status(
+    assessment: PathCapabilityAssessment,
+    selected_capabilities: Sequence[str],
+) -> str:
+    selected_inferences = [
+        assessment.inference_for_capability(capability_name)
+        for capability_name in selected_capabilities
+    ]
+    if any(
+        inference.model_verdict == MODEL_VERDICT_INDICATES_ALLOWED
+        for inference in selected_inferences
+    ):
+        return PATH_MODEL_STATUS_AT_LEAST_ONE_CAPABILITY_ALLOWED
+    if all(
+        inference.model_verdict == MODEL_VERDICT_SKIPPED
+        for inference in selected_inferences
+    ):
+        return PATH_MODEL_STATUS_SKIPPED
+    if any(
+        inference.model_verdict == MODEL_VERDICT_INSUFFICIENT_EVIDENCE
+        for inference in selected_inferences
+    ):
+        return PATH_MODEL_STATUS_INSUFFICIENT_EVIDENCE
+    return PATH_MODEL_STATUS_NO_CAPABILITY_ALLOWED
+
+
+def selected_capability_uncertainty_grade(
+    assessment: PathCapabilityAssessment,
+    selected_capabilities: Sequence[str],
+) -> str | None:
+    uncertainty_grades = {
+        uncertainty_grade_for_reason_sequence(inference.evidence_reasons)
+        for capability_name in selected_capabilities
+        if (
+            inference := assessment.inference_for_capability(capability_name)
+        ).model_verdict
+        == MODEL_VERDICT_INSUFFICIENT_EVIDENCE
+    }
+    if UNCERTAINTY_GRADE_MATERIAL in uncertainty_grades:
+        return UNCERTAINTY_GRADE_MATERIAL
+    if UNCERTAINTY_GRADE_ROUTINE in uncertainty_grades:
+        return UNCERTAINTY_GRADE_ROUTINE
+    return None
+
+
+def assessment_enumeration_uncertainty_grade(
+    assessment: PathCapabilityAssessment,
+) -> str | None:
+    enumeration_reasons: list[EvidenceReason] = []
+    try:
+        enumeration_reasons.extend(
+            reason
+            for reason in assessment.observation_notes
+            if reason.reason_code in ENUMERATION_UNCERTAINTY_REASON_CODES
+        )
+    except (AttributeError, TypeError):
+        pass
+    try:
+        enumeration_reasons.extend(
+            reason
+            for inference in assessment.inference_by_capability_name.values()
+            for reason in inference.evidence_reasons
+            if reason.reason_code in ENUMERATION_UNCERTAINTY_REASON_CODES
+        )
+    except TypeError:
+        # Test doubles and third-party callers may provide only the documented
+        # inference_for_capability interface.  Enumeration accounting is
+        # supplemental and must not force allocation or introspection.
+        pass
+    if not enumeration_reasons:
+        return None
+    reason_grades = {
+        evidence_reason_uncertainty_grade(reason) or UNCERTAINTY_GRADE_MATERIAL
+        for reason in enumeration_reasons
+    }
+    if UNCERTAINTY_GRADE_MATERIAL in reason_grades:
+        return UNCERTAINTY_GRADE_MATERIAL
+    return UNCERTAINTY_GRADE_ROUTINE
+
+
+def assessment_has_enumeration_uncertainty(
+    assessment: PathCapabilityAssessment,
+) -> bool:
+    """Compatibility predicate for callers that do not need the grade."""
+    return assessment_enumeration_uncertainty_grade(assessment) is not None
+
+
 def structured_record_should_be_emitted(
     record: StructuredPathAuditRecord,
     *,
@@ -5231,6 +7427,8 @@ def resolve_audit_output_presentation(
     """Resolve explicit presentation intent before consulting output context."""
     if configuration.requested_output_presentation != OUTPUT_PRESENTATION_AUTOMATIC:
         return configuration.requested_output_presentation
+    if configuration.full_audit:
+        return OUTPUT_PRESENTATION_JSON_LINES
     if configuration.output_destination != "-":
         return OUTPUT_PRESENTATION_JSON_LINES
     if output_stream_is_attached_to_terminal(output_stream):
@@ -5241,18 +7439,64 @@ def resolve_audit_output_presentation(
 def iterate_structured_path_audit_records(
     configuration: AuditCommandLineConfiguration,
     permission_auditor: LinuxFilesystemMutationPermissionAuditor,
+    *,
+    statistics: AuditRunStatistics | None = None,
 ) -> Iterator[StructuredPathAuditRecord]:
     selected_capabilities = configuration.selected_capabilities
+    active_statistics = statistics or AuditRunStatistics()
 
     for normalized_scan_root in configuration.scan_root_paths:
         for path_assessment in permission_auditor.assess_path_tree(
             normalized_scan_root,
             selected_capabilities=selected_capabilities,
         ):
+            active_statistics.assessed_path_count += 1
+            selected_uncertainty_grade = selected_capability_uncertainty_grade(
+                path_assessment,
+                selected_capabilities,
+            )
+            if selected_uncertainty_grade is not None:
+                active_statistics.selected_capability_uncertainty_path_count += 1
+                if selected_uncertainty_grade == UNCERTAINTY_GRADE_MATERIAL:
+                    active_statistics.material_selected_capability_uncertainty_path_count += 1
+                else:
+                    active_statistics.routine_selected_capability_uncertainty_path_count += 1
+            assessment_status = determine_assessment_model_status(
+                path_assessment,
+                selected_capabilities,
+            )
+            if assessment_status == PATH_MODEL_STATUS_AT_LEAST_ONE_CAPABILITY_ALLOWED:
+                active_statistics.allowed_path_count += 1
+            elif assessment_status == PATH_MODEL_STATUS_NO_CAPABILITY_ALLOWED:
+                active_statistics.blocked_path_count += 1
+            elif assessment_status == PATH_MODEL_STATUS_INSUFFICIENT_EVIDENCE:
+                active_statistics.uncertain_path_count += 1
+                if selected_uncertainty_grade == UNCERTAINTY_GRADE_ROUTINE:
+                    active_statistics.routine_uncertain_path_count += 1
+                else:
+                    active_statistics.material_uncertain_path_count += 1
+            else:
+                active_statistics.skipped_path_count += 1
+            enumeration_uncertainty_grade = assessment_enumeration_uncertainty_grade(
+                path_assessment
+            )
+            if enumeration_uncertainty_grade is not None:
+                active_statistics.enumeration_uncertainty_path_count += 1
+                if enumeration_uncertainty_grade == UNCERTAINTY_GRADE_MATERIAL:
+                    active_statistics.material_enumeration_uncertainty_path_count += 1
+                else:
+                    active_statistics.routine_enumeration_uncertainty_path_count += 1
             if not path_assessment_should_be_emitted(
                 path_assessment,
                 configuration=configuration,
             ):
+                active_statistics.filtered_path_count += 1
+                if assessment_status == PATH_MODEL_STATUS_INSUFFICIENT_EVIDENCE:
+                    active_statistics.filtered_uncertain_path_count += 1
+                    if selected_uncertainty_grade == UNCERTAINTY_GRADE_ROUTINE:
+                        active_statistics.routine_filtered_uncertain_path_count += 1
+                    else:
+                        active_statistics.material_filtered_uncertain_path_count += 1
                 continue
             structured_record = path_assessment.create_structured_record(
                 selected_capabilities=selected_capabilities,
@@ -5262,6 +7506,7 @@ def iterate_structured_path_audit_records(
                 structured_record,
                 configuration=configuration,
             ):
+                active_statistics.emitted_path_record_count += 1
                 yield structured_record
 
 
@@ -5386,11 +7631,14 @@ def write_all_terminal_path_audit_records(
     configuration: AuditCommandLineConfiguration,
     permission_auditor: LinuxFilesystemMutationPermissionAuditor,
     output_stream: TextIO,
+    *,
+    statistics: AuditRunStatistics | None = None,
 ) -> None:
     """Write the concise interactive view without JSON provenance records."""
     for structured_record in iterate_structured_path_audit_records(
         configuration,
         permission_auditor,
+        statistics=statistics,
     ):
         write_terminal_path_audit_record(
             structured_record,
@@ -5403,10 +7651,12 @@ def write_structured_path_audit_record(
     *,
     output_stream: TextIO,
     serialized_audit_run_provenance: Mapping[str, object],
+    include_routine_uncertainty: bool,
 ) -> None:
     write_json_line_to_audit_report(
         record.as_serializable_dictionary(
-            serialized_audit_run_provenance=serialized_audit_run_provenance
+            serialized_audit_run_provenance=serialized_audit_run_provenance,
+            include_routine_uncertainty=include_routine_uncertainty,
         ),
         output_stream=output_stream,
     )
@@ -5418,8 +7668,12 @@ def write_all_audit_records(
     output_stream: TextIO,
     *,
     audit_run_provenance: AuditRunProvenance,
+    statistics: AuditRunStatistics | None = None,
 ) -> None:
-    serialized_audit_run_provenance = audit_run_provenance.as_serializable_dictionary()
+    active_statistics = statistics or AuditRunStatistics()
+    serialized_audit_run_provenance = audit_run_provenance.as_serializable_dictionary(
+        include_routine_uncertainty=configuration.include_nonmatching_records
+    )
     write_audit_run_provenance_record(
         output_stream=output_stream,
         serialized_audit_run_provenance=(serialized_audit_run_provenance),
@@ -5427,12 +7681,21 @@ def write_all_audit_records(
     for structured_record in iterate_structured_path_audit_records(
         configuration,
         permission_auditor,
+        statistics=active_statistics,
     ):
         write_structured_path_audit_record(
             structured_record,
             output_stream=output_stream,
             serialized_audit_run_provenance=(serialized_audit_run_provenance),
+            include_routine_uncertainty=configuration.include_nonmatching_records,
         )
+    write_audit_run_completion_record(
+        output_stream=output_stream,
+        audit_run_provenance=audit_run_provenance,
+        statistics=active_statistics,
+        fail_on_uncertainty=configuration.fail_on_uncertainty,
+        include_routine_uncertainty=configuration.include_nonmatching_records,
+    )
 
 
 def write_audit_run_provenance_record(
@@ -5446,6 +7709,71 @@ def write_audit_run_provenance_record(
             "record_schema_id": STRUCTURED_RECORD_SCHEMA_ID,
             "record_type": "audit_run_provenance",
             "audit_run_provenance": serialized_audit_run_provenance,
+        },
+        output_stream=output_stream,
+    )
+
+
+def write_audit_run_completion_record(
+    *,
+    output_stream: TextIO,
+    audit_run_provenance: AuditRunProvenance,
+    statistics: AuditRunStatistics,
+    fail_on_uncertainty: bool,
+    include_routine_uncertainty: bool,
+) -> None:
+    """Mark a JSONL stream as fully generated and summarize filtered evidence."""
+    write_json_line_to_audit_report(
+        {
+            "record_schema_id": STRUCTURED_RECORD_SCHEMA_ID,
+            "record_type": "audit_run_completion",
+            "audit_run_id": audit_run_provenance.audit_run_id,
+            "audit_completed_at_utc": current_utc_timestamp(),
+            "audit_algorithm_completed": True,
+            **(
+                {
+                    "filesystem_scope_enumeration_is_complete": (
+                        statistics.filesystem_scope_enumeration_is_complete
+                        if include_routine_uncertainty
+                        else False
+                    )
+                }
+                if (
+                    include_routine_uncertainty
+                    or not statistics.material_filesystem_scope_enumeration_is_complete
+                )
+                else {}
+            ),
+            "statistics": statistics.as_serializable_dictionary(
+                include_routine_uncertainty=include_routine_uncertainty
+            ),
+            **(
+                {
+                    "uncertainty_policy": {
+                        "fail_on_uncertainty": fail_on_uncertainty,
+                        "reported_uncertainty_grade": (
+                            "routine_and_material"
+                            if include_routine_uncertainty
+                            else UNCERTAINTY_GRADE_MATERIAL
+                        ),
+                        "uncertainty_was_observed": (
+                            statistics.uncertainty_was_observed
+                            if include_routine_uncertainty
+                            else statistics.material_uncertainty_was_observed
+                        ),
+                        "policy_was_satisfied": (
+                            not fail_on_uncertainty
+                            or not statistics.material_uncertainty_was_observed
+                        ),
+                    }
+                }
+                if (
+                    include_routine_uncertainty
+                    or fail_on_uncertainty
+                    or statistics.material_uncertainty_was_observed
+                )
+                else {}
+            ),
         },
         output_stream=output_stream,
     )
@@ -5588,14 +7916,21 @@ class PrivateReportPublication:
                 "report output presentation must already be resolved: "
                 f"{report_output_presentation!r}"
             )
-        self.destination_path = lexically_normalize_absolute_path(
+        requested_components = split_requested_path_without_normalizing(
             requested_destination_path
         )
-        self.destination_parent_directory_path = lexically_normalize_absolute_path(
-            os.path.dirname(self.destination_path) or "."
+        self.requested_destination_path = (
+            requested_components.absolute_path_with_dot_components
         )
-        self.destination_entry_name = os.path.basename(self.destination_path)
-        if not self.destination_entry_name:
+        self.destination_path = self.requested_destination_path
+        self.destination_parent_directory_path = (
+            requested_components.parent_path_with_dot_components
+        )
+        self.destination_entry_name = requested_components.final_component
+        if (
+            requested_components.trailing_separator_requires_directory
+            or requested_components.final_component_is_dot_or_dot_dot
+        ):
             raise ReportPublicationError(
                 "report destination has no filename: "
                 f"{quote_path_for_diagnostic(self.destination_path)}"
@@ -5683,6 +8018,23 @@ class PrivateReportPublication:
             raise
         self.destination_directory_file_descriptor = (
             destination_directory_file_descriptor
+        )
+        canonical_parent_path, canonical_path_note = (
+            observe_canonical_path_for_file_descriptor(
+                destination_directory_file_descriptor,
+                fallback_path=self.destination_parent_directory_path,
+            )
+        )
+        if canonical_path_note is not None:
+            os.close(destination_directory_file_descriptor)
+            self.destination_directory_file_descriptor = None
+            raise ReportPublicationError(
+                "cannot establish the canonical report destination parent: "
+                f"{canonical_path_note.reason_code}"
+            )
+        self.destination_parent_directory_path = canonical_parent_path
+        self.destination_path = lexically_normalize_absolute_path(
+            os.path.join(canonical_parent_path, self.destination_entry_name)
         )
 
     def _require_destination_directory_file_descriptor(self) -> int:
@@ -6149,6 +8501,72 @@ def configure_standard_output_for_human_readable_paths() -> None:
         return
 
 
+def runtime_compatibility_error() -> str | None:
+    """Return a user-facing reason this process cannot run the Linux backend."""
+    if sys.version_info < (3, 9):  # noqa: UP036 - explicit runtime diagnostic
+        return (
+            "Python 3.9 or newer is required; running "
+            f"{sys.version_info.major}.{sys.version_info.minor}"
+        )
+    if not sys.platform.startswith("linux"):
+        return (
+            "this release implements only the Linux evidence backend; "
+            f"running platform is {sys.platform!r}. Darwin and BSD require "
+            "native credential, mount, inode-flag, and access-query backends"
+        )
+    required_runtime_features = (
+        (pwd is not None, "the POSIX pwd module"),
+        (hasattr(os, "getresuid"), "os.getresuid"),
+        (hasattr(os, "getresgid"), "os.getresgid"),
+        (_LINUX_C_LIBRARY is not None, "the process C library"),
+        (_LINUX_SYSCALL_FUNCTION is not None, "libc syscall(2)"),
+    )
+    missing_features = [
+        feature_name
+        for feature_is_available, feature_name in required_runtime_features
+        if not feature_is_available
+    ]
+    if missing_features:
+        return "Linux runtime is missing: " + ", ".join(missing_features)
+    return None
+
+
+def collect_run_level_uncertainty_reasons(
+    *,
+    process_credentials: LinuxProcessCredentialEvidence,
+    mount_table_read: LinuxMountTableReadEvidence,
+    audit_scope: AuditScopeEvidence,
+    observed_tool_source_file: ObservedToolSourceFileEvidence,
+) -> tuple[EvidenceReason, ...]:
+    uncertainty_reasons: list[EvidenceReason] = list(
+        mount_table_read.uncertainty_reasons
+    )
+    if process_credentials.filesystem_identifiers.uncertainty_reason is not None:
+        uncertainty_reasons.append(
+            process_credentials.filesystem_identifiers.uncertainty_reason
+        )
+    if process_credentials.effective_capabilities.uncertainty_reason is not None:
+        uncertainty_reasons.append(
+            process_credentials.effective_capabilities.uncertainty_reason
+        )
+    if observed_tool_source_file.uncertainty_reason is not None:
+        uncertainty_reasons.append(observed_tool_source_file.uncertainty_reason)
+    uncertainty_reasons.extend(
+        rule.classification_uncertainty_reason
+        for rule in audit_scope.exclusion_rules
+        if rule.classification_uncertainty_reason is not None
+    )
+    if audit_scope.home_directory_discovery is not None:
+        uncertainty_reasons.extend(
+            audit_scope.home_directory_discovery.uncertainty_reasons
+        )
+    if audit_scope.temporary_directory_discovery is not None:
+        uncertainty_reasons.extend(
+            audit_scope.temporary_directory_discovery.uncertainty_reasons
+        )
+    return tuple(deduplicate_preserving_first_occurrence(uncertainty_reasons))
+
+
 def execute_audit_to_stream(
     configuration: AuditCommandLineConfiguration,
     output_stream: TextIO,
@@ -6157,7 +8575,7 @@ def execute_audit_to_stream(
     audit_run_id: str,
     audit_started_at_utc: str,
     internally_ignored_paths: Sequence[str],
-) -> None:
+) -> AuditExecutionResult:
     if output_presentation not in (
         OUTPUT_PRESENTATION_TERMINAL_PATHS,
         OUTPUT_PRESENTATION_JSON_LINES,
@@ -6173,19 +8591,38 @@ def execute_audit_to_stream(
         process_credentials=process_credentials,
         internally_ignored_paths=internally_ignored_paths,
     )
+    observed_tool_source_file = observe_tool_source_file()
     permission_auditor = build_permission_auditor(
         configuration,
         mount_table_read=mount_table_read,
         process_credentials=process_credentials,
         audit_scope=audit_scope,
     )
+    run_level_uncertainty_reasons = collect_run_level_uncertainty_reasons(
+        process_credentials=process_credentials,
+        mount_table_read=mount_table_read,
+        audit_scope=audit_scope,
+        observed_tool_source_file=observed_tool_source_file,
+    )
+    routine_run_level_reason_count = sum(
+        evidence_reason_uncertainty_grade(reason) == UNCERTAINTY_GRADE_ROUTINE
+        for reason in run_level_uncertainty_reasons
+    )
+    statistics = AuditRunStatistics(
+        run_level_uncertainty_reason_count=len(run_level_uncertainty_reasons),
+        material_run_level_uncertainty_reason_count=(
+            len(run_level_uncertainty_reasons) - routine_run_level_reason_count
+        ),
+        routine_run_level_uncertainty_reason_count=(routine_run_level_reason_count),
+    )
     if output_presentation == OUTPUT_PRESENTATION_TERMINAL_PATHS:
         write_all_terminal_path_audit_records(
             configuration,
             permission_auditor,
             output_stream,
+            statistics=statistics,
         )
-        return
+        return AuditExecutionResult(statistics=statistics)
 
     audit_run_provenance = build_audit_run_provenance(
         audit_run_id=audit_run_id,
@@ -6194,19 +8631,28 @@ def execute_audit_to_stream(
         process_credentials=process_credentials,
         mount_table_read=mount_table_read,
         audit_scope=audit_scope,
+        observed_tool_source_file=observed_tool_source_file,
     )
     write_all_audit_records(
         configuration,
         permission_auditor,
         output_stream,
         audit_run_provenance=audit_run_provenance,
+        statistics=statistics,
     )
+    return AuditExecutionResult(statistics=statistics)
 
 
 def run_audit_command(command_line_arguments: Sequence[str]) -> int:
     audit_run_id = str(uuid.uuid4())
     audit_started_at_utc = current_utc_timestamp()
     configuration = parse_audit_command_line_arguments(command_line_arguments)
+    compatibility_error = runtime_compatibility_error()
+    if compatibility_error is not None:
+        write_diagnostic_to_standard_error(
+            f"{AUDIT_TOOL_NAME}: unsupported runtime: {compatibility_error}\n"
+        )
+        return EXIT_COMMAND_LINE_REFUSED
     output_presentation = resolve_audit_output_presentation(
         configuration,
         sys.stdout,
@@ -6222,11 +8668,12 @@ def run_audit_command(command_line_arguments: Sequence[str]) -> int:
         )
         return EXIT_COMMAND_LINE_REFUSED
 
+    audit_execution_result: AuditExecutionResult | None = None
     try:
         if configuration.output_destination == "-":
             if output_presentation == OUTPUT_PRESENTATION_TERMINAL_PATHS:
                 configure_standard_output_for_human_readable_paths()
-            execute_audit_to_stream(
+            audit_execution_result = execute_audit_to_stream(
                 configuration,
                 sys.stdout,
                 output_presentation=output_presentation,
@@ -6253,7 +8700,7 @@ def run_audit_command(command_line_arguments: Sequence[str]) -> int:
                     raise ReportPublicationError(
                         "internal invariant failed: report stream unavailable"
                     )
-                execute_audit_to_stream(
+                audit_execution_result = execute_audit_to_stream(
                     configuration,
                     report_publication.text_stream,
                     output_presentation=output_presentation,
@@ -6286,6 +8733,27 @@ def run_audit_command(command_line_arguments: Sequence[str]) -> int:
         )
         return EXIT_AUDIT_RUNTIME_FAILED
 
+    if audit_execution_result is None:
+        write_diagnostic_to_standard_error(
+            f"{AUDIT_TOOL_NAME}: audit runtime failed: no completion result\n"
+        )
+        return EXIT_AUDIT_RUNTIME_FAILED
+
+    statistics = audit_execution_result.statistics
+    if (
+        configuration.fail_on_uncertainty
+        and statistics.material_uncertainty_was_observed
+    ):
+        write_diagnostic_to_standard_error(
+            f"{AUDIT_TOOL_NAME}: audit completed with material uncertainty; "
+            f"assessed={statistics.assessed_path_count}; "
+            "material_uncertain_paths="
+            f"{statistics.material_uncertain_path_count}; "
+            "paths_with_material_selected_capability_uncertainty="
+            f"{statistics.material_selected_capability_uncertainty_path_count}; "
+            "see the completed report for details\n"
+        )
+        return EXIT_AUDIT_EVIDENCE_UNCERTAIN
     return EXIT_AUDIT_COMPLETED
 
 

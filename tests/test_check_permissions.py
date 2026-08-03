@@ -164,11 +164,21 @@ class PermissionInferenceVerificationTests(unittest.TestCase):
                         str(read_only_file),
                         audit_under_test.CAPABILITY_EVALUATION_ORDER,
                     )
-                    self.assertEqual(
+                    read_only_append_inference = (
                         read_only_assessment.inference_for_capability(
                             audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT
-                        ).model_verdict,
-                        audit_under_test.MODEL_VERDICT_INDICATES_BLOCKED,
+                        )
+                    )
+                    self.assertEqual(
+                        read_only_append_inference.model_verdict,
+                        audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                    )
+                    self.assertIn(
+                        "target_write_access_may_be_changeable_by_chmod",
+                        {
+                            reason.reason_code
+                            for reason in read_only_append_inference.evidence_reasons
+                        },
                     )
                     self.assertEqual(
                         read_only_assessment.inference_for_capability(
@@ -185,7 +195,7 @@ class PermissionInferenceVerificationTests(unittest.TestCase):
                         locked_assessment.inference_for_capability(
                             audit_under_test.CAPABILITY_CREATE_DIRECTORY_ENTRY
                         ).model_verdict,
-                        audit_under_test.MODEL_VERDICT_INDICATES_BLOCKED,
+                        audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
                     )
 
                     symbolic_link_assessment = assess_one_path(
@@ -270,6 +280,92 @@ class PermissionInferenceVerificationTests(unittest.TestCase):
                     audit_under_test.lexically_normalize_absolute_path(reported_path),
                     expected_normalized_path,
                 )
+
+    def test_symlink_then_dot_dot_uses_kernel_component_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            lexical_parent = fixture_root / "lexical"
+            physical_parent = fixture_root / "physical"
+            lexical_parent.mkdir()
+            (physical_parent / "through-link").mkdir(parents=True)
+            kernel_selected_directory = physical_parent / "selected"
+            kernel_selected_directory.mkdir()
+            lexically_selected_directory = lexical_parent / "selected"
+            lexically_selected_directory.mkdir()
+            (lexical_parent / "link").symlink_to(physical_parent / "through-link")
+            requested_path = lexical_parent / "link" / ".." / "selected"
+
+            assessment = assess_one_path(
+                str(requested_path),
+                (audit_under_test.CAPABILITY_CREATE_DIRECTORY_ENTRY,),
+            )
+
+        self.assertEqual(assessment.audited_path, str(kernel_selected_directory))
+        self.assertNotEqual(assessment.audited_path, str(lexically_selected_directory))
+
+    def test_trailing_separator_retains_kernel_directory_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            regular_file = Path(temporary_directory) / "regular-file"
+            regular_file.write_bytes(b"content")
+
+            assessment = assess_one_path(
+                str(regular_file) + "/",
+                audit_under_test.DEFAULT_MUTATION_CAPABILITIES,
+            )
+
+        self.assertEqual(
+            assessment.filesystem_object_kind,
+            audit_under_test.FILESYSTEM_OBJECT_KIND_UNOBSERVED,
+        )
+        self.assertEqual(
+            {
+                inference.model_verdict
+                for inference in assessment.inference_by_capability_name.values()
+            },
+            {audit_under_test.MODEL_VERDICT_INDICATES_BLOCKED},
+        )
+        self.assertEqual(
+            next(iter(assessment.inference_by_capability_name.values()))
+            .evidence_reasons[0]
+            .reason_code,
+            "requested_path_component_is_not_a_directory",
+        )
+
+    def test_requested_missing_name_is_revalidated_after_assessment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            missing_path = Path(temporary_directory) / "initially-missing"
+            active_auditor = permission_auditor()
+            assess_missing_normally = (
+                active_auditor.assess_explicitly_requested_missing_path
+            )
+
+            def assess_then_create_name(*args, **kwargs):
+                assessment = assess_missing_normally(*args, **kwargs)
+                missing_path.write_bytes(b"appeared")
+                return assessment
+
+            with mock.patch.object(
+                active_auditor,
+                "assess_explicitly_requested_missing_path",
+                side_effect=assess_then_create_name,
+            ):
+                assessment = assess_one_path(
+                    str(missing_path),
+                    (audit_under_test.CAPABILITY_CREATE_DIRECTORY_ENTRY,),
+                    auditor=active_auditor,
+                )
+
+        create_inference = assessment.inference_for_capability(
+            audit_under_test.CAPABILITY_CREATE_DIRECTORY_ENTRY
+        )
+        self.assertEqual(
+            create_inference.model_verdict,
+            audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+        )
+        self.assertIn(
+            "requested_missing_path_appeared_during_assessment",
+            {reason.reason_code for reason in create_inference.evidence_reasons},
+        )
 
     def test_explicit_uncertain_filesystem_type_augments_defaults(self) -> None:
         configuration = audit_under_test.parse_audit_command_line_arguments(
@@ -377,39 +473,21 @@ class PermissionInferenceVerificationTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             fixture_root = Path(temporary_directory)
-            excluded_child = fixture_root / "excluded_child"
-            excluded_child.write_bytes(b"excluded")
-            exclusion_rule = audit_under_test.PathExclusionRule(
-                excluded_path=str(excluded_child),
-                includes_descendants=False,
-                rule_origin="test",
-            )
-            active_auditor = permission_auditor(exclusion_rules=(exclusion_rule,))
-            partial_listing = audit_under_test.DirectoryListingEvidence(
-                child_paths=(str(excluded_child),),
-                listing_failure=audit_under_test.EvidenceReason(
-                    "simulated_partial_directory_read",
-                    evidence_source="test",
-                ),
-                observation_notes=(),
-            )
-
-            with (
-                mock.patch.object(
-                    active_auditor,
-                    "_read_directory_child_paths",
-                    return_value=partial_listing,
-                ),
-                inode_attributes_observed_clear(),
-            ):
-                root_assessment = list(
-                    active_auditor.assess_path_tree(
-                        str(fixture_root),
-                        selected_capabilities=(
-                            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
-                        ),
-                    )
-                )[-1]
+            active_auditor = permission_auditor()
+            with inode_attributes_observed_clear():
+                root_assessment = active_auditor.assess_directory(
+                    str(fixture_root),
+                    os.lstat(fixture_root),
+                    (audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,),
+                    has_uncertain_descendant_delete=False,
+                    has_blocked_descendant_delete=True,
+                    directory_listing_failure=audit_under_test.EvidenceReason(
+                        "simulated_partial_directory_read",
+                        evidence_source="test",
+                    ),
+                    observation_notes=(),
+                    directory_identity_matched_lstat=True,
+                )
 
             root_delete_inference = root_assessment.inference_for_capability(
                 audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
@@ -462,6 +540,14 @@ class AuditScopeDiscoveryEvidenceTests(unittest.TestCase):
                 "getpwnam",
                 return_value=mock.Mock(pw_dir="/people/invoking-home"),
             ),
+            mock.patch.object(
+                audit_under_test,
+                "observe_canonical_existing_directory",
+                side_effect=lambda path, **_kwargs: (
+                    audit_under_test.lexically_normalize_absolute_path(path),
+                    None,
+                ),
+            ),
         ):
             discovery = audit_under_test.discover_process_related_home_directories(
                 process_credentials
@@ -498,6 +584,52 @@ class AuditScopeDiscoveryEvidenceTests(unittest.TestCase):
         self.assertEqual(discovery.uncertainty_reasons, ())
         self.assertTrue(discovery.observed_at_utc.endswith("Z"))
 
+    def test_home_candidate_dot_dot_after_symlink_uses_kernel_resolution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            lexical_parent = fixture_root / "lexical"
+            physical_parent = fixture_root / "physical"
+            lexical_parent.mkdir()
+            (physical_parent / "through-link").mkdir(parents=True)
+            kernel_home = physical_parent / "home"
+            lexical_home = lexical_parent / "home"
+            kernel_home.mkdir()
+            lexical_home.mkdir()
+            (lexical_parent / "link").symlink_to(physical_parent / "through-link")
+            requested_home = lexical_parent / "link" / ".." / "home"
+            process_credentials = mock.Mock(
+                real_user_id=1200,
+                effective_user_id=1200,
+            )
+
+            with (
+                mock.patch.dict(
+                    audit_under_test.os.environ,
+                    {"HOME": str(requested_home)},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    audit_under_test.pwd,
+                    "getpwuid",
+                    return_value=mock.Mock(pw_dir=str(requested_home)),
+                ),
+            ):
+                discovery = audit_under_test.discover_process_related_home_directories(
+                    process_credentials
+                )
+
+        self.assertEqual(
+            discovery.accepted_home_directory_exclusion_paths,
+            (str(kernel_home),),
+        )
+        self.assertNotIn(
+            str(lexical_home),
+            discovery.accepted_home_directory_exclusion_paths,
+        )
+        self.assertEqual(discovery.uncertainty_reasons, ())
+
     def test_temporary_directory_candidates_name_every_current_decision(
         self,
     ) -> None:
@@ -533,6 +665,14 @@ class AuditScopeDiscoveryEvidenceTests(unittest.TestCase):
                     uncertainty_reason=None,
                 ),
             ) as access_observation,
+            mock.patch.object(
+                audit_under_test,
+                "observe_canonical_existing_directory",
+                side_effect=lambda path, **_kwargs: (
+                    audit_under_test.lexically_normalize_absolute_path(path),
+                    None,
+                ),
+            ),
         ):
             discovery = audit_under_test.discover_active_writable_temporary_directory(
                 process_credentials
@@ -834,8 +974,83 @@ class SafeOptimizationVerificationTests(unittest.TestCase):
         self.assertEqual(emitted_records, [])
         assessment.create_structured_record.assert_not_called()
 
+    def test_allowed_path_still_counts_an_uncertain_selected_capability(self) -> None:
+        configuration = audit_under_test.parse_audit_command_line_arguments(
+            (
+                "--capability",
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                "--capability",
+                audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                "/scope",
+            )
+        )
+        assessment = audit_under_test.PathCapabilityAssessment(
+            filesystem_object_kind=(
+                audit_under_test.FILESYSTEM_OBJECT_KIND_REGULAR_FILE
+            ),
+            audited_path="/scope",
+            inference_by_capability_name={
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE: (
+                    audit_under_test.capability_inference(
+                        audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                        audit_under_test.MODEL_VERDICT_INDICATES_ALLOWED,
+                    )
+                ),
+                audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT: (
+                    audit_under_test.capability_inference(
+                        audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                        audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                    )
+                ),
+            },
+        )
+        permission_model = mock.Mock()
+        permission_model.assess_path_tree.return_value = iter((assessment,))
+        statistics = audit_under_test.AuditRunStatistics()
+
+        emitted_records = list(
+            audit_under_test.iterate_structured_path_audit_records(
+                configuration,
+                permission_model,
+                statistics=statistics,
+            )
+        )
+
+        self.assertEqual(len(emitted_records), 1)
+        self.assertEqual(statistics.allowed_path_count, 1)
+        self.assertEqual(statistics.uncertain_path_count, 0)
+        self.assertEqual(
+            statistics.selected_capability_uncertainty_path_count,
+            1,
+        )
+        self.assertTrue(statistics.uncertainty_was_observed)
+
 
 class EvidenceUncertaintyVerificationTests(unittest.TestCase):
+    def test_raw_syscall_map_rejects_kernel_process_abi_width_mismatch(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                audit_under_test,
+                "RUNNING_MACHINE_ARCHITECTURE",
+                "aarch64",
+            ),
+            mock.patch.object(
+                audit_under_test.ctypes,
+                "sizeof",
+                return_value=4,
+            ),
+        ):
+            self.assertIsNone(audit_under_test.linux_syscall_number("statx"))
+
+        with mock.patch.object(
+            audit_under_test,
+            "RUNNING_MACHINE_ARCHITECTURE",
+            "arm",
+        ):
+            self.assertIsNone(audit_under_test.linux_syscall_number("statx"))
+
     def test_statx_structure_layout_matches_every_field_the_auditor_reads(
         self,
     ) -> None:
@@ -851,6 +1066,197 @@ class EvidenceUncertaintyVerificationTests(unittest.TestCase):
             audit_under_test.LinuxStatxStructure.stx_attributes_mask.offset,
             audit_under_test.LINUX_STATX_ATTRIBUTES_MASK_OFFSET_BYTES,
         )
+
+    def test_statx_uses_raw_syscall_when_libc_wrapper_is_missing(self) -> None:
+        if audit_under_test.linux_syscall_number("statx") is None:
+            self.skipTest("test process ABI has no verified statx syscall mapping")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_file = Path(temporary_directory) / "file"
+            audited_file.write_bytes(b"content")
+            with mock.patch.object(
+                audit_under_test,
+                "_LINUX_STATX_FUNCTION",
+                None,
+            ):
+                evidence = audit_under_test.observe_linux_inode_attributes(
+                    str(audited_file),
+                    follow_final_symbolic_link=True,
+                )
+
+        self.assertNotIn(
+            "linux_statx_unavailable_for_process_abi",
+            {reason.reason_code for reason in evidence.uncertainty_reasons},
+        )
+        self.assertIsInstance(evidence.immutable_attribute_is_set, bool)
+        self.assertIsInstance(evidence.append_only_attribute_is_set, bool)
+
+    def test_access_query_preserves_denial_and_failure_errno(self) -> None:
+        process_credentials = current_credential_evidence()
+
+        def failed_access_with_errno(error_number):
+            def fail(*_args):
+                ctypes.set_errno(error_number)
+                return -1
+
+            return fail
+
+        with mock.patch.object(
+            audit_under_test,
+            "call_linux_faccessat2",
+            side_effect=failed_access_with_errno(errno.EACCES),
+        ):
+            denied = audit_under_test.ask_kernel_about_path_access(
+                "/modeled",
+                os.W_OK,
+                process_credentials=process_credentials,
+            )
+        with mock.patch.object(
+            audit_under_test,
+            "call_linux_faccessat2",
+            side_effect=failed_access_with_errno(errno.EIO),
+        ):
+            failed = audit_under_test.ask_kernel_about_path_access(
+                "/modeled",
+                os.W_OK,
+                process_credentials=process_credentials,
+            )
+
+        self.assertFalse(denied.access_is_allowed)
+        self.assertEqual(denied.operating_system_errno, errno.EACCES)
+        self.assertIsNone(failed.access_is_allowed)
+        self.assertEqual(failed.operating_system_errno, errno.EIO)
+        self.assertEqual(
+            failed.uncertainty_reason.reason_code,
+            "effective_id_access_check_failed",
+        )
+
+    def test_pre_faccessat2_kernel_fallback_is_acl_correct_for_matching_ids(
+        self,
+    ) -> None:
+        if audit_under_test._LINUX_FACCESSAT_FUNCTION is None:
+            self.skipTest("libc does not expose faccessat")
+        process_credentials = current_credential_evidence()
+        if (
+            process_credentials.real_user_id != process_credentials.effective_user_id
+            or process_credentials.real_group_id
+            != process_credentials.effective_group_id
+            or process_credentials.effective_user_id == 0
+            or process_credentials.effective_capabilities.capability_mask != 0
+        ):
+            self.skipTest(
+                "test process identity does not permit the safe faccessat fallback"
+            )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_file = Path(temporary_directory) / "file"
+            audited_file.write_bytes(b"content")
+
+            def unavailable_faccessat2(*_args):
+                ctypes.set_errno(errno.ENOSYS)
+                return -1
+
+            with mock.patch.object(
+                audit_under_test,
+                "call_linux_faccessat2",
+                side_effect=unavailable_faccessat2,
+            ):
+                evidence = audit_under_test.ask_kernel_about_path_access(
+                    str(audited_file),
+                    os.R_OK,
+                    process_credentials=process_credentials,
+                )
+
+        self.assertTrue(evidence.access_is_allowed)
+        self.assertIn("matching real/effective", evidence.evidence_source)
+
+    def test_pre_faccessat2_fallback_rejects_non_equivalent_capability_semantics(
+        self,
+    ) -> None:
+        current_credentials = current_credential_evidence()
+
+        def unavailable_faccessat2(*_args):
+            ctypes.set_errno(errno.ENOSYS)
+            return -1
+
+        for effective_user_id, effective_capability_mask in ((0, 0), (1000, 1)):
+            with self.subTest(
+                effective_user_id=effective_user_id,
+                effective_capability_mask=effective_capability_mask,
+            ):
+                process_credentials = replace(
+                    current_credentials,
+                    real_user_id=effective_user_id,
+                    effective_user_id=effective_user_id,
+                    real_group_id=1000,
+                    effective_group_id=1000,
+                    filesystem_identifiers=replace(
+                        current_credentials.filesystem_identifiers,
+                        filesystem_user_id=effective_user_id,
+                        filesystem_group_id=1000,
+                        uncertainty_reason=None,
+                    ),
+                    effective_capabilities=(
+                        audit_under_test.EffectiveLinuxCapabilityMaskEvidence(
+                            capability_mask=effective_capability_mask,
+                            uncertainty_reason=None,
+                        )
+                    ),
+                )
+                faccessat_fallback = mock.Mock(return_value=0)
+                with (
+                    mock.patch.object(
+                        audit_under_test,
+                        "call_linux_faccessat2",
+                        side_effect=unavailable_faccessat2,
+                    ),
+                    mock.patch.object(
+                        audit_under_test,
+                        "_LINUX_FACCESSAT_FUNCTION",
+                        faccessat_fallback,
+                    ),
+                ):
+                    evidence = audit_under_test.ask_kernel_about_path_access(
+                        "/modeled",
+                        os.W_OK,
+                        process_credentials=process_credentials,
+                    )
+
+                faccessat_fallback.assert_not_called()
+                self.assertIsNone(evidence.access_is_allowed)
+                self.assertEqual(
+                    evidence.uncertainty_reason.reason_code,
+                    "linux_faccessat2_unavailable_and_faccessat_semantics_are_not_equivalent",
+                )
+
+    def test_clearable_immutable_flag_is_uncertain_not_permanently_blocked(
+        self,
+    ) -> None:
+        credentials = current_credential_evidence()
+        filesystem_user_id = credentials.filesystem_identifiers.filesystem_user_id
+        self.assertIsNotNone(filesystem_user_id)
+        capability_mask = (
+            1 << audit_under_test.LINUX_CAPABILITY_LINUX_IMMUTABLE_NUMBER
+        ) | (1 << audit_under_test.LINUX_CAPABILITY_FOWNER_NUMBER)
+        privileged_credentials = replace(
+            credentials,
+            effective_capabilities=audit_under_test.EffectiveLinuxCapabilityMaskEvidence(
+                capability_mask=capability_mask,
+                uncertainty_reason=None,
+            ),
+        )
+        active_auditor = permission_auditor(process_credentials=privileged_credentials)
+
+        reasons, is_uncertain, is_blocked = (
+            active_auditor._infer_set_inode_flag_constraint(
+                attribute_is_set=True,
+                inode_owner_user_id=filesystem_user_id,
+                blocking_reason_code="blocked",
+                potentially_clearable_reason_code="may_be_clearable",
+            )
+        )
+
+        self.assertTrue(is_uncertain)
+        self.assertFalse(is_blocked)
+        self.assertEqual(reasons[0].reason_code, "may_be_clearable")
 
     def test_filesystem_identifiers_are_read_from_current_thread_status(
         self,
@@ -921,7 +1327,7 @@ class EvidenceUncertaintyVerificationTests(unittest.TestCase):
             "cannot_read_effective_linux_capabilities",
         )
 
-    def test_unreported_statx_attribute_bits_are_explicitly_uncertain(
+    def test_unsupported_statx_attribute_bits_are_observed_as_clear(
         self,
     ) -> None:
         def statx_without_supported_attributes(
@@ -961,23 +1367,14 @@ class EvidenceUncertaintyVerificationTests(unittest.TestCase):
                 "/", follow_final_symbolic_link=True
             )
 
-        self.assertIsNone(pre_statx_verity_evidence.immutable_attribute_is_set)
-        self.assertIsNone(pre_statx_verity_evidence.append_only_attribute_is_set)
+        self.assertFalse(pre_statx_verity_evidence.immutable_attribute_is_set)
+        self.assertFalse(pre_statx_verity_evidence.append_only_attribute_is_set)
         self.assertIsNone(pre_statx_verity_evidence.verity_attribute_is_set)
         self.assertEqual(
             pre_statx_verity_evidence.verity_uncertainty_reason.reason_code,
             "running_kernel_predates_documented_statx_verity_reporting",
         )
-        self.assertEqual(
-            {
-                reason.reason_code
-                for reason in pre_statx_verity_evidence.uncertainty_reasons
-            },
-            {
-                "filesystem_did_not_report_immutable_attribute_support",
-                "filesystem_did_not_report_append_only_attribute_support",
-            },
-        )
+        self.assertEqual(pre_statx_verity_evidence.uncertainty_reasons, ())
 
         with (
             mock.patch.object(
@@ -1152,7 +1549,7 @@ class DirectoryTraversalVerificationTests(unittest.TestCase):
             audited_directory.mkdir()
             child_path = audited_directory / "child"
             child_path.write_bytes(b"child")
-            real_lstat = audit_under_test.os.lstat
+            real_open = audit_under_test.os.open
 
             for simulated_error, expected_kind, expected_reason_code in (
                 (
@@ -1161,26 +1558,30 @@ class DirectoryTraversalVerificationTests(unittest.TestCase):
                     "path_disappeared_during_directory_scan",
                 ),
                 (
-                    PermissionError(errno.EACCES, "simulated metadata denial"),
+                    PermissionError(errno.EACCES, "simulated capture denial"),
                     audit_under_test.FILESYSTEM_OBJECT_KIND_UNOBSERVED,
-                    "cannot_observe_path_metadata",
+                    "cannot_capture_directory_entry",
                 ),
             ):
                 with self.subTest(reason_code=expected_reason_code):
 
-                    def lstat_with_child_failure(
+                    def open_with_child_failure(
                         path,
+                        flags,
+                        mode=0o777,
+                        *,
+                        dir_fd=None,
                         simulated_child_error=simulated_error,
                     ):
-                        if str(path) == str(child_path):
+                        if path == child_path.name and dir_fd is not None:
                             raise simulated_child_error
-                        return real_lstat(path)
+                        return real_open(path, flags, mode, dir_fd=dir_fd)
 
                     with (
                         mock.patch.object(
                             audit_under_test.os,
-                            "lstat",
-                            side_effect=lstat_with_child_failure,
+                            "open",
+                            side_effect=open_with_child_failure,
                         ),
                         inode_attributes_observed_clear(),
                     ):
@@ -1226,13 +1627,13 @@ class DirectoryTraversalVerificationTests(unittest.TestCase):
             open_directory_normally = active_auditor._open_directory_for_listing
 
             def open_directory_with_distinct_observed_identity(
-                directory_path: str,
+                directory_file_descriptor: int,
             ) -> audit_under_test.OpenDirectoryForListingEvidence:
-                normal_open_evidence = open_directory_normally(directory_path)
+                normal_open_evidence = open_directory_normally(
+                    directory_file_descriptor
+                )
                 return audit_under_test.OpenDirectoryForListingEvidence(
-                    directory_file_descriptor=(
-                        normal_open_evidence.directory_file_descriptor
-                    ),
+                    directory_iterator=normal_open_evidence.directory_iterator,
                     opened_directory_identity=(
                         audit_under_test.FilesystemObjectIdentity(
                             device_number=(
@@ -1271,11 +1672,11 @@ class DirectoryTraversalVerificationTests(unittest.TestCase):
         )
         for inference in assessment.inference_by_capability_name.values():
             self.assertIn(
-                "directory_identity_changed_between_lstat_and_open",
+                "directory_identity_changed_between_capture_and_listing",
                 {reason.reason_code for reason in inference.evidence_reasons},
             )
 
-    def test_child_order_is_stable_for_arbitrary_linux_filename_bytes(
+    def test_streaming_traversal_preserves_arbitrary_linux_filename_bytes(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1309,9 +1710,221 @@ class DirectoryTraversalVerificationTests(unittest.TestCase):
             os.fsencode(os.path.basename(assessment.audited_path))
             for assessment in assessments[:-1]
         ]
+        self.assertCountEqual(observed_child_name_bytes, child_names)
+
+    def test_first_child_is_emitted_before_directory_iterator_is_exhausted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_directory = Path(temporary_directory) / "audited"
+            audited_directory.mkdir()
+            for child_number in range(64):
+                (audited_directory / f"child-{child_number:03d}").write_bytes(b"x")
+            active_auditor = permission_auditor()
+            open_directory_normally = active_auditor._open_directory_for_listing
+            next_call_count = 0
+
+            class CountingDirectoryIterator:
+                def __init__(self, wrapped_iterator):
+                    self.wrapped_iterator = wrapped_iterator
+
+                def __next__(self):
+                    nonlocal next_call_count
+                    next_call_count += 1
+                    return next(self.wrapped_iterator)
+
+                def close(self):
+                    return self.wrapped_iterator.close()
+
+            def open_counted_directory(directory_file_descriptor):
+                evidence = open_directory_normally(directory_file_descriptor)
+                return replace(
+                    evidence,
+                    directory_iterator=CountingDirectoryIterator(
+                        evidence.directory_iterator
+                    ),
+                )
+
+            traversal = active_auditor.assess_path_tree(
+                str(audited_directory),
+                selected_capabilities=(
+                    audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                ),
+            )
+            with (
+                mock.patch.object(
+                    active_auditor,
+                    "_open_directory_for_listing",
+                    side_effect=open_counted_directory,
+                ),
+                inode_attributes_observed_clear(),
+            ):
+                first_assessment = next(traversal)
+                traversal.close()
+
+        self.assertEqual(next_call_count, 1)
+        self.assertTrue(
+            os.path.basename(first_assessment.audited_path).startswith("child-")
+        )
+
+    def test_parent_path_swap_cannot_redirect_descriptor_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            audited_directory = fixture_root / "audited"
+            moved_audited_directory = fixture_root / "captured-original"
+            attacker_directory = fixture_root / "attacker"
+            audited_directory.mkdir()
+            attacker_directory.mkdir()
+            original_child = audited_directory / "child"
+            attacker_child = attacker_directory / "child"
+            original_child.write_bytes(b"original")
+            attacker_child.write_bytes(b"attacker")
+            original_identity = (
+                audit_under_test.FilesystemObjectIdentity.from_stat_result(
+                    os.lstat(original_child)
+                )
+            )
+            attacker_identity = (
+                audit_under_test.FilesystemObjectIdentity.from_stat_result(
+                    os.lstat(attacker_child)
+                )
+            )
+            active_auditor = permission_auditor()
+            assess_leaf_normally = active_auditor.assess_non_directory_path
+            swap_was_performed = False
+
+            def swap_parent_then_assess(*args, **kwargs):
+                nonlocal swap_was_performed
+                if not swap_was_performed:
+                    os.rename(audited_directory, moved_audited_directory)
+                    audited_directory.symlink_to(attacker_directory)
+                    swap_was_performed = True
+                return assess_leaf_normally(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    active_auditor,
+                    "assess_non_directory_path",
+                    side_effect=swap_parent_then_assess,
+                ),
+                inode_attributes_observed_clear(),
+            ):
+                child_assessment, root_assessment = list(
+                    active_auditor.assess_path_tree(
+                        str(audited_directory),
+                        selected_capabilities=(
+                            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                        ),
+                    )
+                )
+
+        observed_child_identity = audit_under_test.FilesystemObjectIdentity(
+            device_number=(child_assessment.audited_path_lstat_metadata.device_number),
+            inode_number=child_assessment.audited_path_lstat_metadata.inode_number,
+        )
+        self.assertEqual(observed_child_identity, original_identity)
+        self.assertNotEqual(observed_child_identity, attacker_identity)
         self.assertEqual(
-            observed_child_name_bytes,
-            sorted(child_names),
+            root_assessment.inference_for_capability(
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
+            ).model_verdict,
+            audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+        )
+
+    def test_file_descriptor_exhaustion_stops_scope_with_named_uncertainty(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_directory = Path(temporary_directory) / "audited"
+            audited_directory.mkdir()
+            (audited_directory / "child").write_bytes(b"child")
+            real_open = audit_under_test.os.open
+
+            def open_with_exhausted_child_budget(
+                path,
+                flags,
+                mode=0o777,
+                *,
+                dir_fd=None,
+            ):
+                if path == "child" and dir_fd is not None:
+                    raise OSError(errno.EMFILE, "simulated descriptor exhaustion")
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    audit_under_test.os,
+                    "open",
+                    side_effect=open_with_exhausted_child_budget,
+                ),
+                inode_attributes_observed_clear(),
+            ):
+                assessments = list(
+                    permission_auditor().assess_path_tree(
+                        str(audited_directory),
+                        selected_capabilities=(
+                            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                        ),
+                    )
+                )
+
+        self.assertEqual(len(assessments), 1)
+        delete_inference = assessments[0].inference_for_capability(
+            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE
+        )
+        self.assertEqual(
+            delete_inference.model_verdict,
+            audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+        )
+        self.assertIn(
+            "directory_traversal_file_descriptor_budget_exhausted",
+            {reason.reason_code for reason in delete_inference.evidence_reasons},
+        )
+
+    def test_listing_failure_marks_scope_incomplete_without_delete_capability(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_directory = Path(temporary_directory) / "audited"
+            audited_directory.mkdir()
+            (audited_directory / "child").write_bytes(b"child")
+            real_open = audit_under_test.os.open
+
+            def open_with_exhausted_child_budget(
+                path,
+                flags,
+                mode=0o777,
+                *,
+                dir_fd=None,
+            ):
+                if path == "child" and dir_fd is not None:
+                    raise OSError(errno.EMFILE, "simulated descriptor exhaustion")
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    audit_under_test.os,
+                    "open",
+                    side_effect=open_with_exhausted_child_budget,
+                ),
+                inode_attributes_observed_clear(),
+            ):
+                assessments = list(
+                    permission_auditor().assess_path_tree(
+                        str(audited_directory),
+                        selected_capabilities=(
+                            audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                        ),
+                    )
+                )
+
+        self.assertEqual(len(assessments), 1)
+        self.assertTrue(
+            audit_under_test.assessment_has_enumeration_uncertainty(assessments[0])
+        )
+        self.assertIn(
+            "directory_traversal_file_descriptor_budget_exhausted",
+            {reason.reason_code for reason in assessments[0].observation_notes},
         )
 
     @unittest.skipUnless(
@@ -1652,6 +2265,255 @@ class CommandAndReportTransportContractTests(unittest.TestCase):
             decoded_help,
         )
 
+    def test_non_linux_platform_gets_explicit_backend_diagnostic(self) -> None:
+        diagnostic_stream = io.StringIO()
+        with (
+            mock.patch.object(audit_under_test.sys, "platform", "darwin"),
+            contextlib.redirect_stderr(diagnostic_stream),
+        ):
+            exit_status = audit_under_test.run_audit_command(("/scope",))
+
+        self.assertEqual(exit_status, audit_under_test.EXIT_COMMAND_LINE_REFUSED)
+        self.assertIn("only the Linux evidence backend", diagnostic_stream.getvalue())
+        self.assertIn("Darwin and BSD", diagnostic_stream.getvalue())
+
+    def test_non_linux_platform_is_guarded_during_module_initialization(self) -> None:
+        child_environment = os.environ.copy()
+        child_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        command_source = (
+            "import runpy, sys; "
+            "sys.platform = 'darwin'; "
+            f"sys.argv = [{str(AUDIT_SCRIPT_PATH)!r}, '/scope']; "
+            f"runpy.run_path({str(AUDIT_SCRIPT_PATH)!r}, run_name='__main__')"
+        )
+        completed_command = subprocess.run(
+            [sys.executable, "-c", command_source],
+            capture_output=True,
+            env=child_environment,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(
+            completed_command.returncode,
+            audit_under_test.EXIT_COMMAND_LINE_REFUSED,
+        )
+        self.assertIn(
+            b"only the Linux evidence backend",
+            completed_command.stderr,
+        )
+
+    def test_fail_on_uncertainty_writes_completion_then_exits_five(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_file = Path(temporary_directory) / "audited"
+            audited_file.write_bytes(b"content")
+            missing_exclusion = Path(temporary_directory) / "missing-exclusion"
+            completed_command = run_audit_tool_command(
+                "--fail-on-uncertainty",
+                "--exclude",
+                missing_exclusion,
+                audited_file,
+            )
+
+        decoded_records = [
+            json.loads(line)
+            for line in completed_command.stdout.decode("ascii").splitlines()
+        ]
+        self.assertEqual(
+            completed_command.returncode,
+            audit_under_test.EXIT_AUDIT_EVIDENCE_UNCERTAIN,
+        )
+        completion_record = decoded_records[-1]
+        self.assertEqual(completion_record["record_type"], "audit_run_completion")
+        self.assertTrue(completion_record["audit_algorithm_completed"])
+        self.assertTrue(
+            completion_record["uncertainty_policy"]["uncertainty_was_observed"]
+        )
+        self.assertFalse(
+            completion_record["uncertainty_policy"]["policy_was_satisfied"]
+        )
+
+    def test_material_uncertainty_is_quiet_but_retained_in_default_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_file = Path(temporary_directory) / "audited"
+            audited_file.write_bytes(b"content")
+            missing_exclusion = Path(temporary_directory) / "missing-exclusion"
+            completed_command = run_audit_tool_command(
+                "--exclude",
+                missing_exclusion,
+                audited_file,
+            )
+
+        self.assertEqual(completed_command.returncode, 0)
+        self.assertEqual(completed_command.stderr, b"")
+        decoded_records = [
+            json.loads(line)
+            for line in completed_command.stdout.decode("ascii").splitlines()
+        ]
+        completion_record = decoded_records[-1]
+        self.assertTrue(
+            completion_record["uncertainty_policy"]["uncertainty_was_observed"]
+        )
+        self.assertEqual(
+            completion_record["statistics"]["material_uncertainty"][
+                "run_level_uncertainty_reason_count"
+            ],
+            1,
+        )
+
+    def test_routine_uncertainty_is_hidden_unless_full_audit_is_requested(
+        self,
+    ) -> None:
+        routine_reason = audit_under_test.EvidenceReason(
+            "cannot_list_directory",
+            evidence_source="os.scandir",
+            operating_system_errno=errno.EACCES,
+        )
+        material_reason = audit_under_test.EvidenceReason(
+            "cannot_list_directory",
+            evidence_source="os.scandir",
+            operating_system_errno=errno.EIO,
+        )
+        self.assertEqual(
+            audit_under_test.evidence_reason_uncertainty_grade(routine_reason),
+            audit_under_test.UNCERTAINTY_GRADE_ROUTINE,
+        )
+        self.assertEqual(
+            audit_under_test.evidence_reason_uncertainty_grade(material_reason),
+            audit_under_test.UNCERTAINTY_GRADE_MATERIAL,
+        )
+
+        statistics = audit_under_test.AuditRunStatistics(
+            uncertain_path_count=1,
+            selected_capability_uncertainty_path_count=1,
+            enumeration_uncertainty_path_count=1,
+            routine_uncertain_path_count=1,
+            routine_selected_capability_uncertainty_path_count=1,
+            routine_enumeration_uncertainty_path_count=1,
+        )
+        default_statistics = statistics.as_serializable_dictionary(
+            include_routine_uncertainty=False
+        )
+        full_statistics = statistics.as_serializable_dictionary(
+            include_routine_uncertainty=True
+        )
+        self.assertNotIn("material_uncertainty", default_statistics)
+        self.assertNotIn("uncertainty_by_grade", default_statistics)
+        self.assertEqual(
+            full_statistics["uncertainty_by_grade"]["routine"][
+                "enumeration_uncertainty_path_count"
+            ],
+            1,
+        )
+
+        configuration = audit_under_test.parse_audit_command_line_arguments(
+            ("--full-audit", "/scope")
+        )
+        self.assertTrue(configuration.full_audit)
+        self.assertTrue(configuration.include_nonmatching_records)
+
+        output_stream = io.StringIO()
+        diagnostic_stream = io.StringIO()
+        with (
+            mock.patch.object(
+                audit_under_test,
+                "execute_audit_to_stream",
+                return_value=audit_under_test.AuditExecutionResult(statistics),
+            ),
+            contextlib.redirect_stdout(output_stream),
+            contextlib.redirect_stderr(diagnostic_stream),
+        ):
+            exit_status = audit_under_test.run_audit_command(
+                ("--allow-root-audit", "--fail-on-uncertainty", "/scope")
+            )
+        self.assertEqual(exit_status, 0)
+        self.assertEqual(diagnostic_stream.getvalue(), "")
+
+    def test_default_json_keeps_permission_finding_but_omits_routine_branches(
+        self,
+    ) -> None:
+        routine_reason = audit_under_test.EvidenceReason(
+            "target_write_access_may_be_changeable_by_chmod",
+            evidence_source="inode st_uid and filesystem UID",
+        )
+        assessment = audit_under_test.PathCapabilityAssessment(
+            filesystem_object_kind=(
+                audit_under_test.FILESYSTEM_OBJECT_KIND_REGULAR_FILE
+            ),
+            audited_path="/owner-read-only",
+            inference_by_capability_name={
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE: (
+                    audit_under_test.capability_inference(
+                        audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                        audit_under_test.MODEL_VERDICT_INDICATES_ALLOWED,
+                    )
+                ),
+                audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT: (
+                    audit_under_test.capability_inference(
+                        audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+                        audit_under_test.MODEL_VERDICT_INSUFFICIENT_EVIDENCE,
+                        (routine_reason,),
+                    )
+                ),
+            },
+        )
+        record = assessment.create_structured_record(
+            selected_capabilities=(
+                audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+                audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT,
+            ),
+            originating_scan_root_path="/owner-read-only",
+        )
+        default_path_record = record.as_serializable_dictionary(
+            serialized_audit_run_provenance={},
+            include_routine_uncertainty=False,
+        )
+        self.assertIn(
+            audit_under_test.CAPABILITY_DELETE_ENTRY_OR_TREE,
+            default_path_record["model_indicated_capabilities"],
+        )
+        self.assertNotIn(
+            "capabilities_with_insufficient_evidence",
+            default_path_record,
+        )
+        self.assertNotIn("uncertainty_grade_by_capability", default_path_record)
+        full_path_record = record.as_serializable_dictionary(
+            serialized_audit_run_provenance={},
+            include_routine_uncertainty=True,
+        )
+        self.assertEqual(
+            full_path_record["uncertainty_grade_by_capability"][
+                audit_under_test.CAPABILITY_APPEND_REGULAR_FILE_CONTENT
+            ],
+            audit_under_test.UNCERTAINTY_GRADE_ROUTINE,
+        )
+
+    def test_runtime_failure_leaves_jsonl_without_completion_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audited_file = Path(temporary_directory) / "audited"
+            audited_file.write_bytes(b"content")
+            output_stream = io.StringIO()
+            diagnostic_stream = io.StringIO()
+            with (
+                mock.patch.object(
+                    audit_under_test.LinuxFilesystemMutationPermissionAuditor,
+                    "assess_path_tree",
+                    side_effect=OSError(errno.EIO, "simulated traversal failure"),
+                ),
+                contextlib.redirect_stdout(output_stream),
+                contextlib.redirect_stderr(diagnostic_stream),
+            ):
+                exit_status = audit_under_test.run_audit_command(
+                    ("--allow-root-audit", str(audited_file))
+                )
+
+        record_types = [
+            json.loads(line)["record_type"]
+            for line in output_stream.getvalue().splitlines()
+        ]
+        self.assertEqual(exit_status, audit_under_test.EXIT_AUDIT_RUNTIME_FAILED)
+        self.assertEqual(record_types, ["audit_run_provenance"])
+
     def test_output_presentation_uses_context_unless_explicitly_overridden(
         self,
     ) -> None:
@@ -1928,6 +2790,7 @@ class JsonlEvidenceContractTests(unittest.TestCase):
             [
                 "audit_run_provenance",
                 "filesystem_path_capability_assessment",
+                "audit_run_completion",
             ],
         )
 
@@ -2039,11 +2902,16 @@ class JsonlEvidenceContractTests(unittest.TestCase):
             for line in completed_command.stdout.decode("ascii").splitlines()
         ]
         self.assertEqual(completed_command.returncode, 0)
-        self.assertEqual(len(decoded_records), 1)
+        self.assertEqual(len(decoded_records), 2)
         self.assertEqual(
             decoded_records[0]["record_type"],
             "audit_run_provenance",
         )
+        self.assertEqual(
+            decoded_records[1]["record_type"],
+            "audit_run_completion",
+        )
+        self.assertTrue(decoded_records[1]["audit_algorithm_completed"])
 
 
 class ReportPublicationVerificationTests(unittest.TestCase):
@@ -2070,6 +2938,67 @@ class ReportPublicationVerificationTests(unittest.TestCase):
                 f"{audit_under_test.OUTPUT_PRESENTATION_JSON_LINES}.attempt-*.tmp"
             )
         )
+
+    def test_renameat2_uses_raw_syscall_when_libc_wrapper_is_missing(self) -> None:
+        if audit_under_test.linux_syscall_number("renameat2") is None:
+            self.skipTest("test process ABI has no verified renameat2 mapping")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory_file_descriptor = os.open(
+                temporary_directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            try:
+                (Path(temporary_directory) / "source").write_bytes(b"report")
+                with mock.patch.object(
+                    audit_under_test,
+                    "_LINUX_RENAMEAT2_FUNCTION",
+                    None,
+                ):
+                    audit_under_test.rename_linux_directory_entry_with_flags(
+                        directory_file_descriptor,
+                        "source",
+                        directory_file_descriptor,
+                        "destination",
+                        audit_under_test.RENAME_NOREPLACE,
+                    )
+            finally:
+                os.close(directory_file_descriptor)
+
+            self.assertFalse((Path(temporary_directory) / "source").exists())
+            self.assertEqual(
+                (Path(temporary_directory) / "destination").read_bytes(),
+                b"report",
+            )
+
+    def test_output_parent_dot_dot_after_symlink_uses_kernel_resolution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            lexical_parent = fixture_root / "lexical"
+            physical_parent = fixture_root / "physical"
+            lexical_parent.mkdir()
+            (physical_parent / "through-link").mkdir(parents=True)
+            kernel_output_directory = physical_parent / "reports"
+            lexical_output_directory = lexical_parent / "reports"
+            kernel_output_directory.mkdir()
+            lexical_output_directory.mkdir()
+            (lexical_parent / "link").symlink_to(physical_parent / "through-link")
+            audited_file = fixture_root / "audited"
+            audited_file.write_bytes(b"content")
+            requested_output = (
+                lexical_parent / "link" / ".." / "reports" / "audit.jsonl"
+            )
+
+            completed_command = run_audit_tool_command(
+                "--output",
+                requested_output,
+                audited_file,
+            )
+
+            self.assertEqual(completed_command.returncode, 0)
+            self.assertTrue((kernel_output_directory / "audit.jsonl").is_file())
+            self.assertFalse((lexical_output_directory / "audit.jsonl").exists())
 
     def test_new_report_is_private_unpublished_then_atomically_named(
         self,
